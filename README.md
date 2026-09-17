@@ -45,7 +45,3 @@ No existing files were moved or deleted to create this showcase. It is a curated
 ## Project context and credit
 
 This work builds on [LineageOS](https://github.com/LineageOS), [AOSP](https://source.android.com/), the [msm8953-mainline community kernel](https://github.com/msm8953-mainline/linux), and [libcamera](https://libcamera.org/). Upstream projects and their contributors retain credit for their work. This is an unofficial project, not an official Xiaomi or LineageOS release.
-
-## Publishing
-
-Create an empty GitHub repository and use this `showcase/` directory as its local repository root—not the parent Android workspace. Review all exported material and its licensing before publication, choose a documentation license without relicensing upstream source, then make an initial commit and add your GitHub remote. No commit, remote, or upload is created automatically.
