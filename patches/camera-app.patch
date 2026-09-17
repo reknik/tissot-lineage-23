@@ -1,0 +1,47 @@
+diff --git a/Android.bp b/Android.bp
+index 8487fd4e7dbff5936baa745c8da9915c8d2d9735..f1c23aa0b3b715609e54d03e44b560ac5b893291 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -59,4 +59,9 @@ android_app {
+         "libjni_tinyplanet",
+         "libjni_jpegutil",
+     ],
++
++    // The app is also distributed as a /data install on this port, so embed the
++    // JNI libraries in the APK; otherwise the loader cannot find
++    // libjni_jpegutil.so and still capture crashes with UnsatisfiedLinkError.
++    use_embedded_native_libs: true,
+ }
+diff --git a/res/values/strings.xml b/res/values/strings.xml
+index 923a068c4628a9431b26a73b845a8212c3bbbb16..127c35403210a3c8e7634b6d490308e2d67a1f6b 100644
+--- a/res/values/strings.xml
++++ b/res/values/strings.xml
+@@ -183,7 +183,7 @@
+     <!-- In select camera setting, back facing camera value. [CHAR LIMIT=14] -->
+     <string name="pref_camera_id_entry_back_value" translatable="false">0</string>
+     <!-- In select camera setting, front-facing camera value. [CHAR LIMIT=14] -->
+-    <string name="pref_camera_id_entry_front_value" translatable="false">1</string>
++    <string name="pref_camera_id_entry_front_value" translatable="false">2</string>
+ 
+     <!-- Settings screen, location setting text. [CHAR LIMIT=20]-->
+     <string name="pref_camera_save_location_title">Save location</string>
+diff --git a/src/com/android/camera/settings/Keys.java b/src/com/android/camera/settings/Keys.java
+index 0339ea6c7a7a6cefb942be1b117e1fe98889d528..b0c4aa3dd0e89995b7b6e1d8f8555dbcbeeaa2d0 100644
+--- a/src/com/android/camera/settings/Keys.java
++++ b/src/com/android/camera/settings/Keys.java
+@@ -111,6 +111,15 @@ public class Keys {
+ 
+         settingsManager.setDefaults(KEY_CAMERA_FIRST_USE_HINT_SHOWN, true);
+ 
++        // Default the record-location preference (not previously defaulted), so the
++        // first-run "Remember photo locations?" dialog does not reappear on every
++        // launch and block the camera. Location tagging stays opt-in.
++        settingsManager.setDefaults(KEY_RECORD_LOCATION, false);
++        if (!settingsManager.isSet(SettingsManager.SCOPE_GLOBAL, Keys.KEY_RECORD_LOCATION)) {
++            settingsManager.setToDefault(SettingsManager.SCOPE_GLOBAL,
++                                         Keys.KEY_RECORD_LOCATION);
++        }
++
+         settingsManager.setDefaults(KEY_FOCUS_MODE,
+             context.getString(R.string.pref_camera_focusmode_default),
+             context.getResources().getStringArray(R.array.pref_camera_focusmode_entryvalues));

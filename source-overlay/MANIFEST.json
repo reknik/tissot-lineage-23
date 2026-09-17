@@ -1,0 +1,158 @@
+[
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/Android.bp"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/include/libcamera/internal/converter.h"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/android/camera_buffer.h"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/android/camera_capabilities.cpp"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/android/camera_device.cpp"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/android/camera_device.h"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/android/camera_request.cpp"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/android/camera_request.h"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/android/mm/cros_camera_buffer.cpp"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/android/mm/generic_camera_buffer.cpp"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/libcamera/base/log.cpp"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/libcamera/camera_sensor_properties.cpp"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/libcamera/converter.cpp"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/libcamera/pipeline/simple/simple.cpp"
+  },
+  {
+    "patch": "libcamera",
+    "project": "external/libcamera",
+    "baseline": "cd4b2eff206afa6746c4864e2bffcc2e1f0e0b9c",
+    "path": "external/libcamera/src/libcamera/converter/converter_softisp.cpp"
+  },
+  {
+    "patch": "camera-app",
+    "project": "packages/apps/Camera2",
+    "baseline": "e0f3c0a88fdb67a41a52d4705b8604c338e57194",
+    "path": "packages/apps/Camera2/Android.bp"
+  },
+  {
+    "patch": "camera-app",
+    "project": "packages/apps/Camera2",
+    "baseline": "e0f3c0a88fdb67a41a52d4705b8604c338e57194",
+    "path": "packages/apps/Camera2/res/values/strings.xml"
+  },
+  {
+    "patch": "camera-app",
+    "project": "packages/apps/Camera2",
+    "baseline": "e0f3c0a88fdb67a41a52d4705b8604c338e57194",
+    "path": "packages/apps/Camera2/src/com/android/camera/settings/Keys.java"
+  },
+  {
+    "patch": "qseed2",
+    "project": "kernel/mainline/msm8953-mainline",
+    "baseline": "7213855948c70fd165356526f1de1c3b6bf4d554",
+    "path": "kernel/mainline/msm8953-mainline/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.c"
+  },
+  {
+    "patch": "qseed2",
+    "project": "kernel/mainline/msm8953-mainline",
+    "baseline": "7213855948c70fd165356526f1de1c3b6bf4d554",
+    "path": "kernel/mainline/msm8953-mainline/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c"
+  },
+  {
+    "patch": "qseed2",
+    "project": "kernel/mainline/msm8953-mainline",
+    "baseline": "7213855948c70fd165356526f1de1c3b6bf4d554",
+    "path": "kernel/mainline/msm8953-mainline/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h"
+  },
+  {
+    "patch": "qseed2",
+    "project": "kernel/mainline/msm8953-mainline",
+    "baseline": "7213855948c70fd165356526f1de1c3b6bf4d554",
+    "path": "kernel/mainline/msm8953-mainline/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.c"
+  },
+  {
+    "patch": "qseed2",
+    "project": "kernel/mainline/msm8953-mainline",
+    "baseline": "7213855948c70fd165356526f1de1c3b6bf4d554",
+    "path": "kernel/mainline/msm8953-mainline/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.h"
+  },
+  {
+    "patch": "qseed2",
+    "project": "kernel/mainline/msm8953-mainline",
+    "baseline": "7213855948c70fd165356526f1de1c3b6bf4d554",
+    "path": "kernel/mainline/msm8953-mainline/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c"
+  },
+  {
+    "patch": "qseed2",
+    "project": "kernel/mainline/msm8953-mainline",
+    "baseline": "7213855948c70fd165356526f1de1c3b6bf4d554",
+    "path": "kernel/mainline/msm8953-mainline/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c"
+  },
+  {
+    "patch": "thermal-hal",
+    "project": "hardware/interfaces",
+    "baseline": "13d687a84c834af855bfb314b853b8372a7aa6d9",
+    "path": "hardware/interfaces/thermal/aidl/default/Thermal.cpp"
+  }
+]

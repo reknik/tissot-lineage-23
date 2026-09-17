@@ -1,0 +1,1738 @@
+diff --git a/Android.bp b/Android.bp
+index 9ff66b08cfca97c7515bcd2e23b514097a9e78d8..cbed99f9d22b9892b38e82929ff20f7ec90d897e 100644
+--- a/Android.bp
++++ b/Android.bp
+@@ -305,6 +305,7 @@ cc_defaults {
+         "src/libcamera/control_serializer.cpp",
+         "src/libcamera/control_validator.cpp",
+         "src/libcamera/converter.cpp",
++        "src/libcamera/converter/converter_softisp.cpp",
+         "src/libcamera/debug_controls.cpp",
+         "src/libcamera/delayed_controls.cpp",
+         "src/libcamera/device_enumerator.cpp",
+@@ -328,6 +329,7 @@ cc_defaults {
+         "src/libcamera/mapped_framebuffer.cpp",
+         "src/libcamera/media_device.cpp",
+         "src/libcamera/media_object.cpp",
++        "src/libcamera/pipeline/simple/simple.cpp",
+         "src/libcamera/pipeline_handler.cpp",
+         "src/libcamera/pixel_format.cpp",
+         "src/libcamera/process.cpp",
+@@ -402,11 +404,17 @@ cc_defaults {
+         "src/android/jpeg/post_processor_jpeg.cpp",
+         "src/android/jpeg/thumbnailer.cpp",
+         "src/android/mm/BufferAdapter.cpp",
+-        "src/android/mm/cros_camera_buffer.cpp",
+-        "src/android/mm/cros_frame_buffer_allocator.cpp",
+-        "src/android/mm/allocator.cpp",
+-        "src/android/mm/camera_buffer_manager_impl.cpp",
+-        "src/android/mm/minigbm_allocator.cpp",
++        /*
++         * Use the Android/gralloc buffer implementations rather than the
++         * Chrome OS ones.  The cros CameraBuffer goes through
++         * crosLibcamera::CameraBufferManager, which requires
++         * minigbm_create_default_device() to succeed; on mainline msm that
++         * fails, and the HAL aborts with a Fatal log.  The generic
++         * implementation imports the camera3 buffer's dmabuf directly and
++         * allocates through the legacy gralloc alloc_device_t.
++         */
++        "src/android/mm/generic_camera_buffer.cpp",
++        "src/android/mm/generic_frame_buffer_allocator.cpp",
+     ],
+ }
+ 
+@@ -462,6 +470,26 @@ cc_library_shared {
+     ],
+ }
+ 
++// Camera provider HAL module for the mainline libcamera integration.
++//
++// The consumer (device/mainline/common/optional/camera-provider-hal_libcamera)
++// packages this as the HAL module that
++// android.hardware.camera.provider@2.4-service_64 loads through
++// hw_get_module("camera") with ro.hardware.camera=libcamera, i.e. it must be
++// installed as camera.libcamera.so -- hence the stem.  It is defined here
++// because the libcamera internals it is built from are only visible inside
++// //external/libcamera.
++cc_library_shared {
++    name: "com.android.hardware.camera.libcamera",
++    defaults: [
++        "libcamera_src_defaults",
++        "libcamera_android_src_defaults",
++        "libipu7_ipa_proxy",
++    ],
++    stem: "camera.libcamera",
++}
++
++
+ genrule {
+     name: "libcamera_mojom_ipu7_ipa_module",
+     srcs: [
+diff --git a/include/libcamera/internal/converter.h b/include/libcamera/internal/converter.h
+index 834ec5ab22dfc7b30aad764ac674f50318cb61d0..8ce2d848f8fe2ee1bffd1510ae45ac1dda8e6c48 100644
+--- a/include/libcamera/internal/converter.h
++++ b/include/libcamera/internal/converter.h
+@@ -60,6 +60,13 @@ public:
+ 
+ 	const std::string &deviceNode() const { return deviceNode_; }
+ 
++protected:
++	/*
++	 * Constructor for converters that are not backed by a media device,
++	 * for example a CPU-based software converter.
++	 */
++	Converter(const std::string &deviceNode);
++
+ private:
+ 	std::string deviceNode_;
+ };
+@@ -73,6 +80,7 @@ public:
+ 	const std::vector<std::string> &compatibles() const { return compatibles_; }
+ 
+ 	static std::unique_ptr<Converter> create(MediaDevice *media);
++	static std::unique_ptr<Converter> create(const std::string &name);
+ 	static std::vector<ConverterFactoryBase *> &factories();
+ 	static std::vector<std::string> names();
+ 
+diff --git a/src/android/camera_buffer.h b/src/android/camera_buffer.h
+index b4531c800fdb8cf5440af43f2b4d60a02da7c924..1f757125c39657e721d167e8aa8e889078cf4444 100644
+--- a/src/android/camera_buffer.h
++++ b/src/android/camera_buffer.h
+@@ -31,6 +31,8 @@ public:
+ 	libcamera::Span<const uint8_t> plane(unsigned int plane) const;
+ 	libcamera::Span<uint8_t> plane(unsigned int plane);
+ 
++	int fd(unsigned int plane) const;
++
+ 	unsigned int stride(unsigned int plane) const;
+ 	unsigned int offset(unsigned int plane) const;
+ 	unsigned int size(unsigned int plane) const;
+@@ -66,6 +68,10 @@ Span<uint8_t> CameraBuffer::plane(unsigned int plane)			\
+ {									\
+ 	return _d()->plane(plane);					\
+ }									\
++int CameraBuffer::fd(unsigned int plane) const				\
++{									\
++	return _d()->fd(plane);						\
++}									\
+ unsigned int CameraBuffer::stride(unsigned int plane) const		\
+ {									\
+ 	return _d()->stride(plane);					\
+diff --git a/src/android/camera_capabilities.cpp b/src/android/camera_capabilities.cpp
+index 77edfa4e73103b2817b43472d02d827459c2d0fb..82cf9adc0ec2f872fd4765df0c7237da64a0fb38 100644
+--- a/src/android/camera_capabilities.cpp
++++ b/src/android/camera_capabilities.cpp
+@@ -657,6 +657,21 @@ int CameraCapabilities::initializeStreamConfigurations()
+ 				 */
+ 				if (tolerance > 1.0)
+ 					minFrameDuration = minFrameDurationCap;
++			} else {
++				/*
++				 * Snap a sensor that runs just below 30 FPS up to
++				 * the 30 FPS target. The Android API1 client
++				 * (Camera2Client) discards every preview size whose
++				 * minimum frame duration exceeds 1e9/29.97, so the
++				 * fitted S5K5E8 (1968 frame lines x 2856 line
++				 * pixels at 167.2 MHz, i.e. 29.76 FPS) would
++				 * otherwise have no preview size at all. Only snap
++				 * when the difference is within 2%.
++				 */
++				float tolerance =
++					(minFrameDuration - minFrameDurationCap) * 100.0 / minFrameDurationCap;
++				if (tolerance <= 2.0)
++					minFrameDuration = minFrameDurationCap;
+ 			}
+ 
+ 			/*
+@@ -667,23 +682,24 @@ int CameraCapabilities::initializeStreamConfigurations()
+ 			minFrameDuration = 1e9 / calculateFps(minFrameDuration);
+ 			maxFrameDuration = 1e9 / calculateFps(maxFrameDuration);
+ 
+-			//Todo, read resolution and frame duration from table
+-			//Full HD 1080p is mandatory for CTS testAvailableStreamConfigs
+-			if (res == maxRes && (res.width > 1920 || res.height > 1080)) {
+-				streamConfigurations_.push_back({
+-					res,
+-					androidFormat,
+-					maxFrameDurationForBurstCapture,
+-					maxFrameDurationForBurstCapture,
+-				});
+-			} else {
+-				streamConfigurations_.push_back({
+-					res,
+-					androidFormat,
+-					minFrameDuration,
+-					maxFrameDuration,
+-				});
+-			}
++			/*
++			 * Report the measured frame duration for the YUV/RGB
++			 * format. The longer burst-capture duration is only
++			 * applied to the JPEG stream below, where it reflects
++			 * the encoder cost. Applying it here as well would
++			 * leave the stream configuration map without any
++			 * IMPLEMENTATION_DEFINED entry faster than 20 FPS when
++			 * the sensor runs just below 30 FPS (so the filter above
++			 * drops every other size), and the Android framework
++			 * aborts while building StreamConfigurationMap when no
++			 * such entry exists.
++			 */
++			streamConfigurations_.push_back({
++				res,
++				androidFormat,
++				minFrameDuration,
++				maxFrameDuration,
++			});
+ 			/*
+ 			 * If the format is HAL_PIXEL_FORMAT_YCbCr_420_888
+ 			 * from which JPEG is produced, add an entry for
+@@ -1375,6 +1391,16 @@ int CameraCapabilities::initializeStaticMetadata()
+ 		}
+ 		staticMetadata_->addEntry(ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS,
+ 					  lensFocalLengths);
++	} else if (facing_ != CAMERA_FACING_EXTERNAL) {
++		/*
++		 * Fixed-focus sensors without a lens driver expose no
++		 * LensFocalLength control, but this key is required for
++		 * non-external cameras: Camera2Client's API1 path fails with
++		 * NO_INIT without it (measured 2026-09-15). Publish a
++		 * placeholder until a measured per-module value is available.
++		 */
++		staticMetadata_->addEntry(ANDROID_LENS_INFO_AVAILABLE_FOCAL_LENGTHS,
++					  std::vector<float>{ 1.0f });
+ 	}
+ 
+ 	std::vector<uint8_t> opticalStabilizations = {
+@@ -1516,6 +1542,18 @@ int CameraCapabilities::initializeStaticMetadata()
+ 		camera_->generateConfiguration({ StreamRole::StillCapture });
+ 	const Size maxRes = cameraConfig->at(0).size;
+ 
++	/*
++	 * Upper bound for the frame rate filter below. CTS asks for 30 FPS, but
++	 * a sensor whose best rate is just under it (the msm8953 S5K5E8 runs at
++	 * 29 FPS) would otherwise lose every stream size but the maximum one,
++	 * leaving the stream configuration map without any usable preview size.
++	 * Cameras that reach 30 FPS or more are unaffected.
++	 */
++	int32_t maxFps = 0;
++	for (const auto &entry : streamConfigurations_)
++		maxFps = std::max(maxFps, calculateFps(entry.minFrameDurationNsec));
++	const int32_t minFpsThreshold = std::min(30, maxFps);
++
+ 	for (const auto &entry : streamConfigurations_) {
+ 		/*
+ 		 * Filter out YUV streams not capable of running at 30 FPS.
+@@ -1528,7 +1566,7 @@ int CameraCapabilities::initializeStaticMetadata()
+ 		 */
+ 		int fps = calculateFps(entry.minFrameDurationNsec);
+ 
+-		if (entry.androidFormat != HAL_PIXEL_FORMAT_BLOB && fps < 30 && entry.resolution != maxRes)
++		if (entry.androidFormat != HAL_PIXEL_FORMAT_BLOB && fps < minFpsThreshold && entry.resolution != maxRes)
+ 			continue;
+ 
+ 		/*
+diff --git a/src/android/camera_device.cpp b/src/android/camera_device.cpp
+index d45bd4e8aa8c644a928163cb44b42aa7b2289997..7d3fdebe11db9d648c3856acb91639be0d8ed285 100644
+--- a/src/android/camera_device.cpp
++++ b/src/android/camera_device.cpp
+@@ -521,7 +521,7 @@ CameraDevice::CameraDevice(unsigned int id, std::shared_ptr<Camera> camera)
+ 	camera_->bufferCompleted.connect(this, &CameraDevice::bufferComplete);
+ 	camera_->metadataAvailable.connect(this, &CameraDevice::metadataAvailable);
+ 	camera_->disconnected.connect(this, &CameraDevice::cameraDisconnected);
+-#ifdef HAVE_ANDROID_OS
++#ifdef USE_CROS_BUFFER_ADAPTER
+ 	mBufferAdapter = std::make_shared<android::BufferAdapter>();
+ #endif
+ }
+@@ -546,7 +546,7 @@ std::unique_ptr<CameraDevice> CameraDevice::create(unsigned int id,
+  */
+ int CameraDevice::initialize(const CameraConfigData *cameraConfigData)
+ {
+-#ifdef HAVE_ANDROID_OS
++#ifdef USE_CROS_BUFFER_ADAPTER
+ 	if (!mBufferAdapter->init()) {
+ 		LOG(HAL, Error) << "Failed to initialize mBufferAdapter";
+ 		return -EINVAL;
+@@ -1003,7 +1003,19 @@ CameraDevice::createFrameBuffer(const buffer_handle_t camera3buffer,
+ 
+ 	std::vector<FrameBuffer::Plane> planes(buf.numPlanes());
+ 	for (size_t i = 0; i < buf.numPlanes(); ++i) {
+-		SharedFD fd{ camera3buffer->data[i] };
++		/*
++		 * Ask the buffer for the file descriptor and the offset of
++		 * each plane: a camera3 buffer can either be backed by a single
++		 * dmabuf, with the planes stored contiguously, or by one dmabuf
++		 * per plane.
++		 *
++		 * The descriptor is kept in a named variable so that
++		 * SharedFD(const int &) is selected, which duplicates it.  The
++		 * descriptors belong to the camera3 buffer and must not be
++		 * closed by the HAL.
++		 */
++		const int bufferFd = buf.fd(i);
++		SharedFD fd{ bufferFd };
+ 		if (!fd.isValid()) {
+ 			LOG(HAL, Fatal) << "No valid fd";
+ 			return nullptr;
+@@ -1012,6 +1024,12 @@ CameraDevice::createFrameBuffer(const buffer_handle_t camera3buffer,
+ 		planes[i].fd = fd;
+ 		planes[i].offset = buf.offset(i);
+ 		planes[i].length = buf.size(i);
++		/*
++		 * Propagate the plane stride so that consumers that write into
++		 * the buffer directly (for example a software converter) can
++		 * address rows correctly.
++		 */
++		planes[i].stride = buf.stride(i);
+ 	}
+ 
+ 	return std::make_unique<HALFrameBuffer>(planes, camera3buffer);
+@@ -1368,7 +1386,7 @@ int CameraDevice::processCaptureRequest(camera3_capture_request_t *camera3Reques
+ 	 * The descriptor and the associated memory reserved here are freed
+ 	 * at request complete time.
+ 	 */
+-#ifdef HAVE_ANDROID_OS
++#ifdef USE_CROS_BUFFER_ADAPTER
+ 	auto descriptor = std::make_unique<Camera3RequestDescriptor>(camera_.get(),
+ 								     mBufferAdapter, camera3Request);
+ #else
+@@ -1916,7 +1934,7 @@ void CameraDevice::sendCaptureResult(Camera3ResultDescriptor *result) const
+ 							 buffer->camera3Buffer, status,
+ 							 -1, buffer->fence.release() };
+ 
+-#ifdef HAVE_ANDROID_OS
++#ifdef USE_CROS_BUFFER_ADAPTER
+ 		camera3_stream_buffer_t outputBufferInternal = outputBuffer;
+ 		mBufferAdapter->decodeStreamBufferPtr(&outputBufferInternal, &outputBuffer);
+ #endif
+diff --git a/src/android/camera_device.h b/src/android/camera_device.h
+index 9ec62fbf0f9fd032a92270fcad8d6f59e570adcd..492f829d55a053b3cd6611df1d650add5c725fff 100644
+--- a/src/android/camera_device.h
++++ b/src/android/camera_device.h
+@@ -34,7 +34,7 @@
+ #include "camera_metadata.h"
+ #include "camera_stream.h"
+ #include "hal_framebuffer.h"
+-#ifdef HAVE_ANDROID_OS
++#ifdef USE_CROS_BUFFER_ADAPTER
+ #include "mm/BufferAdapter.h"
+ #endif
+ 
+@@ -134,7 +134,7 @@ private:
+ 
+ 	unsigned int id_;
+ 	camera3_device_t camera3Device_;
+-#ifdef HAVE_ANDROID_OS
++#ifdef USE_CROS_BUFFER_ADAPTER
+ 	std::shared_ptr<android::BufferAdapter> mBufferAdapter;
+ #endif
+ 
+diff --git a/src/android/camera_request.cpp b/src/android/camera_request.cpp
+index 57680b6745de6135c86262bc3e7d4e3e57d49c8e..debdeb14c9473dbfd343cdcac7898671aa086a74 100644
+--- a/src/android/camera_request.cpp
++++ b/src/android/camera_request.cpp
+@@ -112,7 +112,7 @@ using namespace libcamera;
+ 
+ Camera3RequestDescriptor::Camera3RequestDescriptor(
+ 	Camera *camera,
+-#ifdef HAVE_ANDROID_OS
++#ifdef USE_CROS_BUFFER_ADAPTER
+ 	std::shared_ptr<android::BufferAdapter> bufferAdaptor,
+ #endif
+ 	const camera3_capture_request_t *camera3Request)
+@@ -132,7 +132,7 @@ Camera3RequestDescriptor::Camera3RequestDescriptor(
+ 		CameraStream *stream =
+ 			static_cast<CameraStream *>(buffer.stream->priv);
+ 
+-#ifdef HAVE_ANDROID_OS
++#ifdef USE_CROS_BUFFER_ADAPTER
+ 		camera3_stream_buffer_t outputBuffer = bufferAdaptor->prepareStreamBufferPtr(&buffer);
+ 		buffers_.emplace_back(stream, outputBuffer, this);
+ #else
+diff --git a/src/android/camera_request.h b/src/android/camera_request.h
+index 3a4d97fce50aa16d5c9dac8ba6bf8f372bd96dba..3e1d6a37e4153c49e637120de8abda08e568e263 100644
+--- a/src/android/camera_request.h
++++ b/src/android/camera_request.h
+@@ -22,7 +22,7 @@
+ 
+ #include "camera_metadata.h"
+ #include "hal_framebuffer.h"
+-#ifdef HAVE_ANDROID_OS
++#ifdef USE_CROS_BUFFER_ADAPTER
+ #include "mm/BufferAdapter.h"
+ #endif
+ 
+@@ -99,7 +99,7 @@ public:
+ 	};
+ 
+ 	Camera3RequestDescriptor(libcamera::Camera *camera,
+-#ifdef HAVE_ANDROID_OS
++#ifdef USE_CROS_BUFFER_ADAPTER
+ 				 std::shared_ptr<android::BufferAdapter> bufferAdaptor,
+ #endif
+ 				 const camera3_capture_request_t *camera3Request);
+diff --git a/src/android/mm/cros_camera_buffer.cpp b/src/android/mm/cros_camera_buffer.cpp
+index 215c9c57bf1118af69e7043f9ba03a7cbe8e6608..3f25f94cd585bbe6c761c3ff65ee7999f453c8e0 100644
+--- a/src/android/mm/cros_camera_buffer.cpp
++++ b/src/android/mm/cros_camera_buffer.cpp
+@@ -130,6 +130,15 @@ Span<uint8_t> CameraBuffer::Private::plane(unsigned int plane)
+ 		 bufferManager_->GetPlaneSize(handle_, plane) };
+ }
+ 
++int CameraBuffer::Private::fd(unsigned int plane) const
++{
++	auto handle = camera_buffer_handle_t::FromBufferHandle(handle_);
++	if (!handle || plane >= kMaxPlanes)
++		return -1;
++
++	return handle->fds[plane];
++}
++
+ unsigned int CameraBuffer::Private::stride(unsigned int plane) const
+ {
+ 	return crosLibcamera::CameraBufferManager::GetPlaneStride(handle_, plane);
+diff --git a/src/android/mm/generic_camera_buffer.cpp b/src/android/mm/generic_camera_buffer.cpp
+index 1bd7090d634f137a4006038f0854d2df43be22d5..0d22c01024df3d0ede3435906c52c5ea21944382 100644
+--- a/src/android/mm/generic_camera_buffer.cpp
++++ b/src/android/mm/generic_camera_buffer.cpp
+@@ -10,6 +10,9 @@
+ #include <sys/mman.h>
+ #include <unistd.h>
+ 
++#include <algorithm>
++#include <vector>
++
+ #include <libcamera/base/log.h>
+ 
+ #include "libcamera/internal/formats.h"
+@@ -19,6 +22,34 @@ using namespace libcamera;
+ 
+ LOG_DECLARE_CATEGORY(HAL)
+ 
++/*
++ * Layout of the buffer handle exported by the minigbm based gralloc
++ * (cros_gralloc_handle).  The structure is packed and starts at the first
++ * element of native_handle_t::data, after the file descriptors.
++ */
++struct CrosGrallocHandle {
++	int32_t fds[5];
++	uint32_t strides[4];
++	uint32_t offsets[4];
++	uint32_t sizes[4];
++	uint32_t id;
++	uint32_t width;
++	uint32_t height;
++	uint32_t format;
++	uint32_t tiling;
++	uint64_t format_modifier;
++	uint64_t use_flags;
++	uint32_t magic;
++	uint32_t pixel_stride;
++	int32_t droid_format;
++	int64_t usage;
++	uint32_t num_planes;
++	uint64_t reserved_region_size;
++	uint64_t total_size;
++} __attribute__((packed));
++
++static constexpr uint32_t kCrosGrallocMagic = 0xABCDDCBA;
++
+ class CameraBuffer::Private : public Extensible::Private,
+ 			      public MappedBuffer
+ {
+@@ -33,6 +64,7 @@ public:
+ 
+ 	Span<uint8_t> plane(unsigned int plane);
+ 
++	int fd(unsigned int plane) const;
+ 	unsigned int stride(unsigned int plane) const;
+ 	unsigned int offset(unsigned int plane) const;
+ 	unsigned int size(unsigned int plane) const;
+@@ -41,6 +73,7 @@ public:
+ 
+ private:
+ 	struct PlaneInfo {
++		int fd;
+ 		unsigned int stride;
+ 		unsigned int offset;
+ 		unsigned int size;
+@@ -52,6 +85,16 @@ private:
+ 	int flags_;
+ 	off_t bufferLength_;
+ 	bool mapped_;
++	/*
++	 * True when each plane is backed by its own dmabuf instead of the
++	 * planes being stored contiguously in a single dmabuf.
++	 */
++	bool perPlaneFds_;
++	/*
++	 * True when the plane strides, offsets and sizes were read from the
++	 * gralloc handle rather than computed from the pixel format.
++	 */
++	bool layoutFromGralloc_;
+ 	std::vector<PlaneInfo> planeInfo_;
+ };
+ 
+@@ -59,7 +102,8 @@ CameraBuffer::Private::Private([[maybe_unused]] CameraBuffer *cameraBuffer,
+ 			       buffer_handle_t camera3Buffer,
+ 			       PixelFormat pixelFormat,
+ 			       const Size &size, int flags)
+-	: fd_(-1), flags_(flags), bufferLength_(-1), mapped_(false)
++	: fd_(-1), flags_(flags), bufferLength_(-1), mapped_(false),
++	  perPlaneFds_(false), layoutFromGralloc_(false)
+ {
+ 	error_ = 0;
+ 
+@@ -70,30 +114,95 @@ CameraBuffer::Private::Private([[maybe_unused]] CameraBuffer *cameraBuffer,
+ 		return;
+ 	}
+ 
++	const unsigned int numPlanes = info.numPlanes();
++
+ 	/*
+-	 * As Android doesn't offer an API to query buffer layouts, assume for
+-	 * now that the buffer is backed by a single dmabuf, with planes being
+-	 * stored contiguously.
++	 * The minigbm based gralloc describes the real layout of the buffers it
++	 * allocates in its handle: the number of planes, their file
++	 * descriptors, strides, offsets and sizes.  Use it when it is available
++	 * and consistent with the pixel format, as the format alone cannot
++	 * express the padding and alignment the allocator applies.
+ 	 */
+-	for (int i = 0; i < camera3Buffer->numFds; i++) {
+-		if (camera3Buffer->data[i] == -1 || camera3Buffer->data[i] == fd_)
+-			continue;
++	const CrosGrallocHandle *grallocHandle =
++		reinterpret_cast<const CrosGrallocHandle *>(camera3Buffer->data);
++
++	bool grallocLayoutValid =
++		camera3Buffer->numFds + camera3Buffer->numInts ==
++			static_cast<int>(sizeof(CrosGrallocHandle) / sizeof(int32_t)) &&
++		grallocHandle->magic == kCrosGrallocMagic &&
++		grallocHandle->num_planes == numPlanes && numPlanes <= 4;
++
++	for (unsigned int i = 0; grallocLayoutValid && i < numPlanes; ++i)
++		grallocLayoutValid = grallocHandle->fds[i] >= 0 &&
++				     grallocHandle->strides[i] != 0 &&
++				     grallocHandle->sizes[i] != 0;
++
++	if (grallocLayoutValid) {
++		planeInfo_.resize(numPlanes);
++
++		for (unsigned int i = 0; i < numPlanes; ++i) {
++			planeInfo_[i].fd = grallocHandle->fds[i];
++			planeInfo_[i].stride = grallocHandle->strides[i];
++			planeInfo_[i].offset = grallocHandle->offsets[i];
++			planeInfo_[i].size = grallocHandle->sizes[i];
++		}
+ 
+-		if (fd_ != -1) {
+-			error_ = -EINVAL;
+-			LOG(HAL, Error) << "Discontiguous planes are not supported";
++		fd_ = planeInfo_[0].fd;
++		bufferLength_ = lseek(fd_, 0, SEEK_END);
++		if (bufferLength_ < 0) {
++			error_ = -errno;
++			LOG(HAL, Error) << "Failed to get buffer length";
+ 			return;
+ 		}
+ 
+-		fd_ = camera3Buffer->data[i];
++		layoutFromGralloc_ = true;
++
++		LOG(HAL, Debug)
++			<< "Camera buffer " << size.toString() << "-" << pixelFormat
++			<< ": " << numPlanes << " planes from the gralloc handle"
++			<< " (drm format 0x" << std::hex << grallocHandle->format
++			<< std::dec << ", buffer length " << bufferLength_ << ")";
++
++		for (unsigned int i = 0; i < numPlanes; ++i)
++			LOG(HAL, Debug) << "  plane " << i
++					<< ": fd=" << planeInfo_[i].fd
++					<< " stride=" << planeInfo_[i].stride
++					<< " offset=" << planeInfo_[i].offset
++					<< " size=" << planeInfo_[i].size;
++
++		return;
++	}
++
++	/*
++	 * Android offers no API to query the memory layout of a camera3
++	 * buffer, so the layout is deduced from the file descriptors stored in
++	 * the buffer handle.  Two layouts are supported:
++	 *
++	 * - a single dmabuf backing all the planes, which are stored
++	 *   contiguously.  This is the historical layout of the Android
++	 *   gralloc implementations.
++	 * - one dmabuf per plane.
++	 */
++	std::vector<int> fds;
++	for (int i = 0; i < camera3Buffer->numFds; i++) {
++		const int fd = camera3Buffer->data[i];
++		if (fd < 0)
++			continue;
++		if (std::find(fds.begin(), fds.end(), fd) == fds.end())
++			fds.push_back(fd);
+ 	}
+ 
+-	if (fd_ == -1) {
++	if (fds.empty()) {
+ 		error_ = -EINVAL;
+-		LOG(HAL, Error) << "No valid file descriptor";
++		LOG(HAL, Error) << "No valid file descriptor"
++				<< " (numFds=" << camera3Buffer->numFds
++				<< " numInts=" << camera3Buffer->numInts << ")";
+ 		return;
+ 	}
+ 
++	perPlaneFds_ = numPlanes > 1 && fds.size() >= numPlanes;
++	fd_ = fds[0];
++
+ 	bufferLength_ = lseek(fd_, 0, SEEK_END);
+ 	if (bufferLength_ < 0) {
+ 		error_ = -errno;
+@@ -101,27 +210,66 @@ CameraBuffer::Private::Private([[maybe_unused]] CameraBuffer *cameraBuffer,
+ 		return;
+ 	}
+ 
+-	const unsigned int numPlanes = info.numPlanes();
+ 	planeInfo_.resize(numPlanes);
+ 
+ 	unsigned int offset = 0;
+ 	for (unsigned int i = 0; i < numPlanes; ++i) {
+-		const unsigned int planeSize = info.planeSize(size, i);
++		const int planeFd = perPlaneFds_ ? fds[i] : fd_;
++		off_t planeLength = bufferLength_;
++
++		if (perPlaneFds_ && planeFd != fd_) {
++			planeLength = lseek(planeFd, 0, SEEK_END);
++			if (planeLength < 0) {
++				error_ = -errno;
++				LOG(HAL, Error) << "Failed to get the length of plane " << i;
++				return;
++			}
++		}
+ 
++		/*
++		 * When every plane has its own dmabuf, it starts at offset 0
++		 * of that dmabuf.  Otherwise the planes are addressed through
++		 * cumulative offsets of the single dmabuf.
++		 */
++		const unsigned int planeOffset = perPlaneFds_ ? 0 : offset;
++		const unsigned int formatPlaneSize = info.planeSize(size, i);
++		unsigned int planeSize = formatPlaneSize;
++
++		if (static_cast<off_t>(planeOffset + planeSize) > planeLength) {
++			LOG(HAL, Warning)
++				<< "Plane " << i << " is larger than the buffer:"
++				<< " plane offset=" << planeOffset
++				<< ", plane size=" << planeSize
++				<< ", buffer length=" << planeLength;
++			if (static_cast<off_t>(planeOffset) >= planeLength) {
++				error_ = -EINVAL;
++				return;
++			}
++			planeSize = planeLength - planeOffset;
++		}
++
++		planeInfo_[i].fd = planeFd;
+ 		planeInfo_[i].stride = info.stride(size.width, i, 1u);
+-		planeInfo_[i].offset = offset;
++		planeInfo_[i].offset = planeOffset;
+ 		planeInfo_[i].size = planeSize;
+ 
+-		if (bufferLength_ < offset + planeSize) {
+-			LOG(HAL, Error) << "Plane " << i << " is out of buffer:"
+-					<< " plane offset=" << offset
+-					<< ", plane size=" << planeSize
+-					<< ", buffer length=" << bufferLength_;
+-			return;
+-		}
+-
+-		offset += planeSize;
++		offset += formatPlaneSize;
+ 	}
++
++	LOG(HAL, Debug) << "Camera buffer " << size.toString() << "-" << pixelFormat
++			<< ": numFds=" << camera3Buffer->numFds
++			<< " numInts=" << camera3Buffer->numInts
++			<< " distinct fds=" << fds.size()
++			<< " planes=" << numPlanes
++			<< (perPlaneFds_ ? " (one dmabuf per plane)"
++					 : " (single contiguous dmabuf)");
++
++	for (unsigned int i = 0; i < numPlanes; ++i)
++		LOG(HAL, Debug) << "  plane " << i
++				<< ": fd=" << planeInfo_[i].fd
++				<< " stride=" << planeInfo_[i].stride
++				<< " offset=" << planeInfo_[i].offset
++				<< " size=" << planeInfo_[i].size;
+ }
+ 
+ CameraBuffer::Private::~Private()
+@@ -133,6 +281,14 @@ unsigned int CameraBuffer::Private::numPlanes() const
+ 	return planeInfo_.size();
+ }
+ 
++int CameraBuffer::Private::fd(unsigned int plane) const
++{
++	if (plane >= planeInfo_.size())
++		return -1;
++
++	return planeInfo_[plane].fd;
++}
++
+ Span<uint8_t> CameraBuffer::Private::plane(unsigned int plane)
+ {
+ 	if (!mapped_)
+@@ -179,6 +335,19 @@ void CameraBuffer::Private::map()
+ 	ASSERT(fd_ != -1);
+ 	ASSERT(bufferLength_ >= 0);
+ 
++	/*
++	 * The planes can be mapped as a whole when they live in the buffer
++	 * described by the first file descriptor, either because a single
++	 * dmabuf backs all of them or because the gralloc handle reported
++	 * their offsets within that buffer.  Buffers made of one unrelated
++	 * dmabuf per plane are consumed through the per-plane file descriptors
++	 * and are not expected to be mapped here.
++	 */
++	if (perPlaneFds_ && !layoutFromGralloc_) {
++		LOG(HAL, Error) << "Cannot map a buffer with one dmabuf per plane";
++		return;
++	}
++
+ 	void *address = mmap(nullptr, bufferLength_, flags_, MAP_SHARED, fd_, 0);
+ 	if (address == MAP_FAILED) {
+ 		error_ = -errno;
+diff --git a/src/libcamera/base/log.cpp b/src/libcamera/base/log.cpp
+index b5b69f59be6e6db97e9e1319c0219cb1f7bd7dd3..3370ab74376da2c422636afefba9c95db990bfd1 100644
+--- a/src/libcamera/base/log.cpp
++++ b/src/libcamera/base/log.cpp
+@@ -907,7 +907,7 @@ LogCategory *LogCategory::create(const char *name)
+  * \param[in] name The category name
+  */
+ LogCategory::LogCategory(const char *name)
+-	: name_(name), severity_(LogSeverity::LogInfo)
++	: name_(name), severity_(LogSeverity::LogWarning)
+ {
+ }
+ 
+@@ -1022,12 +1022,8 @@ LogMessage::~LogMessage()
+ 
+ 	msgStream_ << std::endl;
+ 
+-#ifdef HAVE_ANDROID_OS
+-	logger->write(*this);
+-#elif
+ 	if (severity_ >= category_.severity())
+ 		logger->write(*this);
+-#endif
+ 
+ 	if (severity_ == LogSeverity::LogFatal) {
+ 		logger->backtrace();
+diff --git a/src/libcamera/camera_sensor_properties.cpp b/src/libcamera/camera_sensor_properties.cpp
+index 7d4393f7a0996b6e14a0321c5e88cafa99b7eeb0..32e93fd74b1233e74f08b00b0a13099227ec155a 100644
+--- a/src/libcamera/camera_sensor_properties.cpp
++++ b/src/libcamera/camera_sensor_properties.cpp
+@@ -242,6 +242,18 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 				{ controls::draft::TestPatternModeColorBars, 1 },
+ 			},
+ 		} },
++		{ "ov13880", {
++			.unitCellSize = { 1200, 1200 },
++			.testPatternModes = {},
++		} },
++		{ "ov12a10", {
++			.unitCellSize = { 1250, 1250 },
++			.testPatternModes = {},
++		} },
++		{ "s5k5e8", {
++			.unitCellSize = { 1220, 1220 },
++			.testPatternModes = {},
++		} },
+ 		{ "hi1339", {
+ 			.unitCellSize = { 1120, 1120 },
+ 			.testPatternModes = {
+diff --git a/src/libcamera/converter.cpp b/src/libcamera/converter.cpp
+index 9f64eb51b892abc5ec6d793aea358360017522a3..8beccc76d20d1801df69da1c188408dfe498256d 100644
+--- a/src/libcamera/converter.cpp
++++ b/src/libcamera/converter.cpp
+@@ -58,6 +58,18 @@ Converter::Converter(MediaDevice *media)
+ 	deviceNode_ = (*it)->deviceNode();
+ }
+ 
++/**
++ * \brief Construct a Converter instance without a media device
++ * \param[in] deviceNode A name identifying the converter
++ *
++ * This constructor is used by converters that do not have a media device
++ * backing them, such as CPU-based software converters.
++ */
++Converter::Converter(const std::string &deviceNode)
++	: deviceNode_(deviceNode)
++{
++}
++
+ Converter::~Converter()
+ {
+ }
+@@ -235,6 +247,34 @@ std::unique_ptr<Converter> ConverterFactoryBase::create(MediaDevice *media)
+ 	return nullptr;
+ }
+ 
++/**
++ * \brief Create an instance of the converter with a given factory name
++ * \param[in] name The converter factory name
++ *
++ * This is used for converters that have no media device, such as the CPU-based
++ * software converter. Only the factory whose name matches \a name is
++ * considered.
++ *
++ * \return A new instance of the converter subclass, or null if no factory
++ * matches the name or the converter is not valid
++ */
++std::unique_ptr<Converter> ConverterFactoryBase::create(const std::string &name)
++{
++	for (const ConverterFactoryBase *factory : ConverterFactoryBase::factories()) {
++		if (factory->name_ != name)
++			continue;
++
++		LOG(Converter, Debug)
++			<< "Creating converter from " << factory->name_ << " factory";
++
++		std::unique_ptr<Converter> converter = factory->createInstance(nullptr);
++		if (converter && converter->isValid())
++			return converter;
++	}
++
++	return nullptr;
++}
++
+ /**
+  * \brief Add a converter factory to the registry
+  * \param[in] factory Factory to use to construct the converter class
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 05ba76bce630ef3a4e509203b619149c81890b94..2f339e9ebb4d169d84c850a0845f241778cf9e9d 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -20,6 +20,7 @@
+ #include <vector>
+ 
+ #include <linux/media-bus-format.h>
++#include <linux/v4l2-controls.h>
+ 
+ #include <libcamera/base/log.h>
+ 
+@@ -33,6 +34,7 @@
+ #include "libcamera/internal/converter.h"
+ #include "libcamera/internal/device_enumerator.h"
+ #include "libcamera/internal/media_device.h"
++#include "libcamera/internal/mapped_framebuffer.h"
+ #include "libcamera/internal/pipeline_handler.h"
+ #include "libcamera/internal/v4l2_subdevice.h"
+ #include "libcamera/internal/v4l2_videodevice.h"
+@@ -185,6 +187,11 @@ struct SimplePipelineInfo {
+ 	 * and the number of streams it supports.
+ 	 */
+ 	std::vector<std::pair<const char *, unsigned int>> converters;
++	/*
++	 * True if the pipeline can use the CPU-based software converter for
++	 * raw sensors when no hardware converter is available.
++	 */
++	bool softIsp;
+ };
+ 
+ namespace {
+@@ -194,7 +201,12 @@ static const SimplePipelineInfo supportedDevices[] = {
+ 	{ "imx7-csi", { { "pxp", 1 } } },
+ 	{ "j721e-csi2rx", {} },
+ 	{ "mxc-isi", {} },
+-	{ "qcom-camss", {} },
++	/*
++	 * qcom-camss captures raw Bayer only (the VFE has no ISP) and has no
++	 * memory-to-memory converter, so the software converter is needed to
++	 * offer YUV formats such as NV12.
++	 */
++	{ "qcom-camss", {}, true },
+ 	{ "sun6i-csi", {} },
+ };
+ 
+@@ -280,6 +292,20 @@ private:
+ 
+ 	void converterInputDone(FrameBuffer *buffer);
+ 	void converterOutputDone(FrameBuffer *buffer);
++
++	/*
++	 * Software AEC state.  The simple pipeline has no IPA and no AGC:
++	 * without this the sensor runs at whatever cached controls it was
++	 * left with, which is why both rear sensors were "dark and grainy"
++	 * with no control headroom consumed.  See swAecFeedback().
++	 */
++	struct SwAec {
++		bool initialized = false;
++		unsigned int exposure = 0; /* V4L2_CID_EXPOSURE units (lines) */
++		unsigned int gain = 0;	   /* V4L2_CID_ANALOGUE_GAIN units */
++		unsigned int frames = 0;   /* diagnostic frame counter */
++	} swAec_;
++	void swAecFeedback(FrameBuffer *buffer, Request *request);
+ };
+ 
+ class SimpleCameraConfiguration : public CameraConfiguration
+@@ -331,6 +357,7 @@ public:
+ 	V4L2VideoDevice *video(const MediaEntity *entity);
+ 	V4L2Subdevice *subdev(const MediaEntity *entity);
+ 	MediaDevice *converter() { return converter_; }
++	bool softIsp() const { return softIsp_; }
+ 
+ protected:
+ 	int queueRequestDevice(Camera *camera, Request *request) override;
+@@ -359,6 +386,7 @@ private:
+ 	std::map<const MediaEntity *, EntityData> entities_;
+ 
+ 	MediaDevice *converter_;
++	bool softIsp_ = false;
+ };
+ 
+ /* -----------------------------------------------------------------------------
+@@ -494,6 +522,27 @@ int SimpleCameraData::init()
+ 	SimplePipelineHandler *pipe = SimpleCameraData::pipe();
+ 	int ret;
+ 
++	/*
++	 * Report frame duration limits derived from the sensor's pixel rate and
++	 * line/frame lengths.  The Android camera HAL refuses to initialise a
++	 * camera that does not report FrameDurationLimits.
++	 */
++	IPACameraSensorInfo info;
++
++	if (!sensor_->sensorInfo(&info) && info.pixelRate) {
++		int64_t minDuration = static_cast<int64_t>(info.minFrameLength) *
++					      info.minLineLength * 1000000 /
++				      info.pixelRate;
++		int64_t maxDuration = static_cast<int64_t>(info.maxFrameLength) *
++					      info.maxLineLength * 1000000 /
++				      info.pixelRate;
++		ControlInfoMap::Map controls;
++
++		controls[&controls::FrameDurationLimits] =
++			ControlInfo(minDuration, maxDuration);
++		controlInfo_ = ControlInfoMap(std::move(controls), controls::controls);
++	}
++
+ 	/* Open the converter, if any. */
+ 	MediaDevice *converter = pipe->converter();
+ 	if (converter) {
+@@ -502,10 +551,23 @@ int SimpleCameraData::init()
+ 			LOG(SimplePipeline, Warning)
+ 				<< "Failed to create converter, disabling format conversion";
+ 			converter_.reset();
+-		} else {
+-			converter_->inputBufferReady.connect(this, &SimpleCameraData::converterInputDone);
+-			converter_->outputBufferReady.connect(this, &SimpleCameraData::converterOutputDone);
+ 		}
++	} else if (pipe->softIsp()) {
++		/*
++		 * No hardware converter: fall back to the CPU-based software
++		 * converter so that raw sensors can still offer YUV formats.
++		 */
++		converter_ = ConverterFactoryBase::create("softisp");
++		if (!converter_) {
++			LOG(SimplePipeline, Warning)
++				<< "Failed to create software converter, disabling format conversion";
++			converter_.reset();
++		}
++	}
++
++	if (converter_) {
++		converter_->inputBufferReady.connect(this, &SimpleCameraData::converterInputDone);
++		converter_->outputBufferReady.connect(this, &SimpleCameraData::converterOutputDone);
+ 	}
+ 
+ 	video_ = pipe->video(entities_.back().entity);
+@@ -796,6 +858,13 @@ void SimpleCameraData::bufferReady(FrameBuffer *buffer)
+ 		request->metadata().set(controls::SensorTimestamp,
+ 					buffer->metadata().timestamp);
+ 
++	/*
++	 * Feed the raw frame to the software AEC before anything else.  The
++	 * measurement uses the captured buffer itself, so it works both with
++	 * and without the converter, and for free-wheeling internal buffers.
++	 */
++	swAecFeedback(buffer, request);
++
+ 	/*
+ 	 * Queue the captured and the request buffer to the converter if format
+ 	 * conversion is needed. If there's no queued request, just requeue the
+@@ -817,6 +886,136 @@ void SimpleCameraData::bufferReady(FrameBuffer *buffer)
+ 	pipe->completeRequest(request);
+ }
+ 
++/*
++ * Minimal software auto-exposure.  There is no IPA and no AGC anywhere in
++ * this pipeline: the sensor runs at whatever controls were last written,
++ * which is why the viewfinder was stuck dark with the controls cached at
++ * their defaults.  On every successfully captured raw frame, measure the
++ * scene luminance from a decimated sample of the Bayer data and walk
++ * exposure first (up to the driver's frame-length-derived ceiling), then
++ * analogue gain, towards a fixed mid-scale target.  A multiplicative
++ * integrator with a per-frame slew limit keeps this stable.
++ *
++ * Units: V4L2_CID_EXPOSURE is integration time in lines (driver-specific),
++ * V4L2_CID_ANALOGUE_GAIN is the driver's gain code.  Both limits are read
++ * from the sensor's own control ranges, so nothing sensor-specific lives
++ * here.  If the request carries an explicit exposure (Android AE OFF /
++ * manual template), the frame is left alone.
++ */
++void SimpleCameraData::swAecFeedback(FrameBuffer *buffer, Request *request)
++{
++	const ControlInfoMap &ctrls = sensor_->controls();
++	auto expIt = ctrls.find(V4L2_CID_EXPOSURE);
++	auto gainIt = ctrls.find(V4L2_CID_ANALOGUE_GAIN);
++	if (expIt == ctrls.end() || gainIt == ctrls.end()) {
++		LOG(SimplePipeline, Error) << "AEC: no exposure/gain control";
++		return;
++	}
++
++	if (swAec_.frames < 40)
++		LOG(SimplePipeline, Error) << "AEC: frame " << swAec_.frames
++					   << " manual="
++					   << (request && request->controls().contains(controls::EXPOSURE_TIME));
++
++	if (request && request->controls().contains(controls::EXPOSURE_TIME))
++		return;
++
++	if (!swAec_.initialized) {
++		swAec_.exposure = expIt->second.def().get<int32_t>();
++		swAec_.gain = gainIt->second.def().get<int32_t>();
++		swAec_.initialized = true;
++	}
++
++	const FrameMetadata::Plane &plane = buffer->metadata().planes()[0];
++	if (plane.bytesused < 5)
++		return;
++
++	MappedFrameBuffer map(buffer, MappedFrameBuffer::MapFlag::Read);
++	if (!map.isValid()) {
++		if (swAec_.frames < 40)
++			LOG(SimplePipeline, Error) << "AEC: mmap failed";
++		return;
++	}
++	const uint8_t *in = map.planes()[0].data();
++	size_t len = std::min<size_t>(plane.bytesused, map.planes()[0].size());
++
++	/*
++	 * MIPI RAW10: four 10-bit pixels packed into five bytes.  Sample a
++	 * decimated subset (every 256th pixel group) to keep the cost down;
++	 * the high bits of each pixel sit in the fifth byte.  The measurement
++	 * includes the sensor's black pedestal, so does the target.
++	 */
++	uint64_t acc = 0;
++	unsigned int n = 0;
++	for (size_t off = 0; off + 5 <= len; off += 5 * 256) {
++		uint8_t b4 = in[off + 4];
++		acc += (uint16_t(in[off + 0]) << 2) | (b4 & 0x03);
++		acc += (uint16_t(in[off + 1]) << 2) | ((b4 >> 2) & 0x03);
++		acc += (uint16_t(in[off + 2]) << 2) | ((b4 >> 4) & 0x03);
++		acc += (uint16_t(in[off + 3]) << 2) | ((b4 >> 6) & 0x03);
++		n += 4;
++	}
++	if (!n)
++		return;
++	double mean = double(acc) / n;
++	if (mean < 1.0)
++		mean = 1.0;
++
++	const int32_t expMin = expIt->second.min().get<int32_t>();
++	const int32_t expMax = expIt->second.max().get<int32_t>();
++	const int32_t gainMin = gainIt->second.min().get<int32_t>();
++	const int32_t gainMax = gainIt->second.max().get<int32_t>();
++
++	/*
++	 * Target a mid-grey in display space.  The softisp now applies the
++	 * sRGB transfer, so a raw mean of ~20% (200/1023) reconstructs to a
++	 * ~120/255 midtone; the old 460 target assumed a linear pipeline and
++	 * would over-expose once the gamma is applied.
++	 */
++	const double target = 200.0;
++	double ratio = std::clamp(target / mean, 0.70, 1.40);
++
++	int exp = swAec_.exposure;
++	int gain = swAec_.gain;
++
++	if (ratio >= 1.0) {
++		/* Under-exposed: exposure first, gain picks up the rest. */
++		int wantExp = int(double(exp) * ratio);
++		int addExp = std::min(wantExp - exp, expMax - exp);
++		exp += addExp;
++		if (exp < wantExp && gain < gainMax) {
++			gain = std::min<int>(int(double(gain) * ratio), gainMax);
++		}
++	} else {
++		/* Over-exposed: gain down first, then exposure. */
++		int subGain = int(double(gain) * (1.0 - ratio));
++		gain = std::max(gain - subGain, gainMin);
++		if (gain == gainMin)
++			exp = std::max<int>(int(double(exp) * ratio), expMin);
++	}
++
++	if (swAec_.frames < 40)
++		LOG(SimplePipeline, Error)
++			<< "AEC: mean=" << mean << " exp=" << swAec_.exposure
++			<< "->" << exp << " gain=" << swAec_.gain << "->" << gain;
++
++	swAec_.frames++;
++	if (exp == swAec_.exposure && gain == swAec_.gain)
++		return;
++
++	ControlList sensorCtrls(sensor_->controls());
++	sensorCtrls.set(V4L2_CID_EXPOSURE, exp);
++	sensorCtrls.set(V4L2_CID_ANALOGUE_GAIN, gain);
++	int ret = sensor_->setControls(&sensorCtrls);
++	if (ret) {
++		LOG(SimplePipeline, Error)
++			<< "AEC: sensor setControls failed " << ret;
++		return;
++	}
++	swAec_.exposure = exp;
++	swAec_.gain = gain;
++}
++
+ void SimpleCameraData::converterInputDone(FrameBuffer *buffer)
+ {
+ 	/* Queue the input buffer back for capture. */
+@@ -1352,9 +1551,15 @@ std::vector<MediaEntity *> SimplePipelineHandler::locateSensors()
+ 
+ 	/*
+ 	 * Remove duplicates, in case multiple sensors are connected to the
+-	 * same ISP.
++	 * same ISP. Sort by entity name so the camera registration order is
++	 * deterministic across boots: sorting the raw pointers is unspecified
++	 * and varies with heap layout, which made the HAL camera-ID assignment
++	 * nondeterministic (camera 0 could be any sensor).
+ 	 */
+-	std::sort(sensors.begin(), sensors.end());
++	std::sort(sensors.begin(), sensors.end(),
++		  [](const MediaEntity *a, const MediaEntity *b) {
++			  return a->name() < b->name();
++		  });
+ 	auto last = std::unique(sensors.begin(), sensors.end());
+ 	sensors.erase(last, sensors.end());
+ 
+@@ -1418,6 +1623,17 @@ bool SimplePipelineHandler::match(DeviceEnumerator *enumerator)
+ 		}
+ 	}
+ 
++	softIsp_ = info->softIsp;
++
++	if (!converter_ && softIsp_) {
++		/*
++		 * The software converter produces several output streams from
++		 * the same capture stream, so allow configurations such as
++		 * preview plus still capture to be set up together.
++		 */
++		numStreams = 2;
++	}
++
+ 	/* Locate the sensors. */
+ 	std::vector<MediaEntity *> sensors = locateSensors();
+ 	if (sensors.empty()) {
+diff --git a/src/libcamera/converter/converter_softisp.cpp b/src/libcamera/converter/converter_softisp.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9cf1031e6119aacd4f67367d5b25dd7ac573f93
+--- /dev/null
++++ b/src/libcamera/converter/converter_softisp.cpp
+@@ -0,0 +1,593 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * converter_softisp.cpp - CPU Bayer -> NV12 converter for raw sensors
++ *
++ * The mainline Qualcomm CAMSS pipeline captures raw Bayer only (the VFE has no
++ * ISP), and the simple pipeline has no memory-to-memory converter on those
++ * SoCs.  As a result the pipeline cannot offer the YUV formats the Android
++ * camera HAL needs, and a raw camera cannot be exposed to the framework.
++ *
++ * This converter implements the missing raw -> NV12/NV21 step in software: it
++ * unpacks MIPI CSI-2 packed 10-bit Bayer, bilinearly demosaics it to RGB,
++ * scales it to the requested output size and converts it to semi-planar YUV
++ * (BT.601 limited range).  It has no hardware backing and therefore uses the
++ * media-device-less Converter constructor; the simple pipeline instantiates it
++ * by factory name when the device has no hardware converter.
++ */
++
++#include "libcamera/internal/converter.h"
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <map>
++#include <memory>
++#include <thread>
++#include <tuple>
++#include <vector>
++
++#include <libcamera/base/log.h>
++
++#include <libcamera/formats.h>
++#include <libcamera/framebuffer.h>
++#include <libcamera/geometry.h>
++#include <libcamera/pixel_format.h>
++#include <libcamera/stream.h>
++
++#include "libcamera/internal/dma_heaps.h"
++#include "libcamera/internal/mapped_framebuffer.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(SoftIsp)
++
++namespace {
++
++enum class BayerOrder {
++	Grbg,
++	Bggr,
++	Gbrg,
++	Rggb,
++};
++
++struct BayerPattern {
++	int c00;
++	int c01;
++	int c10;
++	int c11;
++};
++
++/* Colour indices: 0 = R, 1 = G, 2 = B. */
++constexpr BayerPattern kPatterns[] = {
++	{ 1, 0, 2, 1 }, /* Grbg */
++	{ 2, 1, 1, 0 }, /* Bggr */
++	{ 1, 2, 0, 1 }, /* Gbrg */
++	{ 0, 1, 1, 2 }, /* Rggb */
++};
++
++inline int colorAt(const BayerPattern &p, int r, int c)
++{
++	int rr = r & 1;
++	int cc = c & 1;
++
++	if (rr == 0)
++		return cc == 0 ? p.c00 : p.c01;
++	return cc == 0 ? p.c10 : p.c11;
++}
++
++inline int to8(uint16_t v)
++{
++	return v >= 1023 ? 255 : (v * 255 + 511) / 1023;
++}
++
++inline int clamp8(int v)
++{
++	return v < 0 ? 0 : (v > 255 ? 255 : v);
++}
++
++/*
++ * sRGB display transfer (linear 8-bit -> gamma-encoded 8-bit).  The sensor
++ * output is linear light; without this the midtones are ~3x too dark for a
++ * display that expects gamma-encoded RGB.
++ */
++const uint8_t *gammaLut()
++{
++	static const std::array<uint8_t, 256> lut = [] {
++		std::array<uint8_t, 256> t{};
++		for (int i = 0; i < 256; i++) {
++			double v = i / 255.0;
++			double s = v <= 0.0031308 ? v * 12.92
++						  : 1.055 * std::pow(v, 1.0 / 2.4) - 0.055;
++			t[i] = static_cast<uint8_t>(std::lround(s * 255.0));
++		}
++		return t;
++	}();
++	return lut.data();
++}
++
++struct RgbGains {
++	double r = 1.0;
++	double g = 1.0;
++	double b = 1.0;
++	bool logged = false;
++};
++
++/*
++ * White-patch auto white balance: treat the 98th percentile of each channel
++ * as the likely-white level and equalise the three, with temporal smoothing
++ * so the preview does not pump colour.  Without this the raw Bayer response
++ * (two green samples per pixel) leaves a strong green cast that a fully
++ * automatic ISP would remove.
++ */
++void updateWhiteBalance(const std::vector<uint8_t> &rgb, size_t npix, RgbGains &gains)
++{
++	if (!npix)
++		return;
++
++	unsigned int hist[3][256] = {};
++	for (size_t i = 0; i < npix; i++) {
++		hist[0][rgb[i * 3 + 0]]++;
++		hist[1][rgb[i * 3 + 1]]++;
++		hist[2][rgb[i * 3 + 2]]++;
++	}
++
++	double ref[3];
++	/* White patch: the brightest 0.5% of each channel should be neutral. */
++	const size_t want = npix * 995 / 1000;
++	for (int ch = 0; ch < 3; ch++) {
++		size_t acc = 0;
++		unsigned int v = 255;
++		for (unsigned int i = 0; i < 256; i++) {
++			acc += hist[ch][i];
++			if (acc >= want) {
++				v = i;
++				break;
++			}
++		}
++		ref[ch] = std::max(1.0, static_cast<double>(v));
++	}
++
++	double avg = (ref[0] + ref[1] + ref[2]) / 3.0;
++	double target[3];
++	for (int ch = 0; ch < 3; ch++)
++		target[ch] = std::clamp(avg / ref[ch], 0.5, 4.0);
++
++	if (!gains.logged) {
++		LOG(SoftIsp, Error) << "AWB p99.5 ref=(" << ref[0] << "," << ref[1]
++				    << "," << ref[2] << ") target=(" << target[0]
++				    << "," << target[1] << "," << target[2] << ")";
++		gains.logged = true;
++	}
++
++	double *cur[3] = { &gains.r, &gains.g, &gains.b };
++	for (int ch = 0; ch < 3; ch++)
++		*cur[ch] = *cur[ch] * 0.9 + target[ch] * 0.1;
++}
++
++bool bayerOrderFor(PixelFormat format, BayerOrder *order)
++{
++	if (format == formats::SGRBG10_CSI2P)
++		*order = BayerOrder::Grbg;
++	else if (format == formats::SBGGR10_CSI2P)
++		*order = BayerOrder::Bggr;
++	else if (format == formats::SGBRG10_CSI2P)
++		*order = BayerOrder::Gbrg;
++	else if (format == formats::SRGGB10_CSI2P)
++		*order = BayerOrder::Rggb;
++	else
++		return false;
++
++	return true;
++}
++
++/* Unpack MIPI CSI-2 RAW10 rows into 16-bit samples. */
++void unpackRow(const uint8_t *src, uint16_t *dst, unsigned int width)
++{
++	for (unsigned int i = 0, j = 0; j < width; i += 5, j += 4) {
++		uint8_t lsb = src[i + 4];
++		dst[j + 0] = (src[i + 0] << 2) | ((lsb >> 0) & 0x3);
++		dst[j + 1] = (src[i + 1] << 2) | ((lsb >> 2) & 0x3);
++		dst[j + 2] = (src[i + 2] << 2) | ((lsb >> 4) & 0x3);
++		dst[j + 3] = (src[i + 3] << 2) | ((lsb >> 6) & 0x3);
++	}
++}
++
++/* Bilinear demosaic of a packed 10-bit Bayer frame into packed RGB888. */
++void debayer(const uint8_t *packed, unsigned int stride, unsigned int width,
++	     unsigned int height, BayerOrder order, std::vector<uint8_t> &rgb,
++	     RgbGains &gains)
++{
++	const BayerPattern &pattern = kPatterns[static_cast<int>(order)];
++	std::vector<uint16_t> bayer(static_cast<size_t>(width) * height);
++
++	for (unsigned int r = 0; r < height; r++)
++		unpackRow(packed + static_cast<size_t>(r) * stride,
++			  bayer.data() + static_cast<size_t>(r) * width, width);
++
++	rgb.resize(static_cast<size_t>(width) * height * 3);
++
++	const unsigned int workerCount = std::min(4u, height);
++	std::vector<std::thread> workers;
++	workers.reserve(workerCount);
++
++	auto processRows = [&](unsigned int first, unsigned int last) {
++	for (unsigned int r = first; r < last; r++) {
++		for (unsigned int c = 0; c < width; c++) {
++			uint8_t *out = rgb.data() + (static_cast<size_t>(r) * width + c) * 3;
++			int own = colorAt(pattern, r, c);
++
++			for (int target = 0; target < 3; target++) {
++				if (target == own) {
++					out[target] = to8(bayer[static_cast<size_t>(r) * width + c]);
++					continue;
++				}
++
++				int sum = 0;
++				int count = 0;
++
++				for (int dr = -1; dr <= 1; dr++) {
++					for (int dc = -1; dc <= 1; dc++) {
++						int rr = static_cast<int>(r) + dr;
++						int cc = static_cast<int>(c) + dc;
++
++						if (rr < 0 || rr >= static_cast<int>(height) ||
++						    cc < 0 || cc >= static_cast<int>(width))
++							continue;
++						if (colorAt(pattern, rr, cc) != target)
++							continue;
++
++						sum += to8(bayer[static_cast<size_t>(rr) * width + cc]);
++						count++;
++					}
++				}
++
++				out[target] = count ? (sum + count / 2) / count
++						    : to8(bayer[static_cast<size_t>(r) * width + c]);
++			}
++		}
++	}
++	};
++
++	for (unsigned int worker = 0; worker < workerCount; worker++) {
++		unsigned int first = height * worker / workerCount;
++		unsigned int last = height * (worker + 1) / workerCount;
++		workers.emplace_back(processRows, first, last);
++	}
++
++	for (std::thread &worker : workers)
++		worker.join();
++
++	updateWhiteBalance(rgb, static_cast<size_t>(width) * height, gains);
++}
++
++void sampleBilinear(const std::vector<uint8_t> &rgb, unsigned int sw,
++		    unsigned int sh, int fx, int fy, int out[3])
++{
++	int x = fx >> 16;
++	int y = fy >> 16;
++	int x1 = std::min(x + 1, static_cast<int>(sw) - 1);
++	int y1 = std::min(y + 1, static_cast<int>(sh) - 1);
++	int wx = fx & 0xffff;
++	int wy = fy & 0xffff;
++
++	const uint8_t *p00 = rgb.data() + (static_cast<size_t>(y) * sw + x) * 3;
++	const uint8_t *p01 = rgb.data() + (static_cast<size_t>(y) * sw + x1) * 3;
++	const uint8_t *p10 = rgb.data() + (static_cast<size_t>(y1) * sw + x) * 3;
++	const uint8_t *p11 = rgb.data() + (static_cast<size_t>(y1) * sw + x1) * 3;
++
++	for (int ch = 0; ch < 3; ch++) {
++		int64_t top = static_cast<int64_t>(p00[ch]) * (65536 - wx) +
++			      static_cast<int64_t>(p01[ch]) * wx;
++		int64_t bot = static_cast<int64_t>(p10[ch]) * (65536 - wx) +
++			      static_cast<int64_t>(p11[ch]) * wx;
++		out[ch] = static_cast<int>((top * (65536 - wy) + bot * wy) >> 32);
++	}
++}
++
++/*
++ * Bilinear-scale the demosaiced RGB frame into a semi-planar NV12/NV21
++ * destination.  Chroma is averaged over each 2x2 output block.
++ */
++void scaleToNv12(const std::vector<uint8_t> &rgb, const Size &src,
++		 uint8_t *yPlane, unsigned int yStride, uint8_t *uvPlane,
++		 unsigned int uvStride, const Size &dst, bool nv21,
++		 const RgbGains &gains)
++{
++	const unsigned int sw = src.width;
++	const unsigned int sh = src.height;
++	const unsigned int dw = dst.width;
++	const unsigned int dh = dst.height;
++
++	for (unsigned int dy = 0; dy < dh; dy++) {
++		int fy = dh > 1 && sh > 1
++			       ? static_cast<int>(static_cast<int64_t>(dy) * (sh - 1) * 65536 / (dh - 1))
++			       : 0;
++
++		for (unsigned int dx = 0; dx < dw; dx++) {
++			int fx = dw > 1 && sw > 1
++				       ? static_cast<int>(static_cast<int64_t>(dx) * (sw - 1) * 65536 / (dw - 1))
++				       : 0;
++			int pixel[3];
++
++			sampleBilinear(rgb, sw, sh, fx, fy, pixel);
++
++			/* White balance in linear light, then the display transfer. */
++			const uint8_t *lut = gammaLut();
++			const double gains3[3] = { gains.r, gains.g, gains.b };
++			for (int ch = 0; ch < 3; ch++)
++				pixel[ch] = lut[clamp8(static_cast<int>(std::lround(pixel[ch] * gains3[ch])))];
++
++			int y = ((66 * pixel[0] + 129 * pixel[1] + 25 * pixel[2] + 128) >> 8) + 16;
++			yPlane[static_cast<size_t>(dy) * yStride + dx] = clamp8(y);
++
++			if ((dx & 1) || (dy & 1))
++				continue;
++
++			int sum[3] = { pixel[0], pixel[1], pixel[2] };
++			int count = 1;
++
++			for (unsigned int oy = 0; oy < 2 && dy + oy < dh; oy++) {
++				for (unsigned int ox = 0; ox < 2 && dx + ox < dw; ox++) {
++					if (oy == 0 && ox == 0)
++						continue;
++					int fyy = dh > 1 && sh > 1
++						  ? static_cast<int>(static_cast<int64_t>(dy + oy) * (sh - 1) * 65536 / (dh - 1))
++						  : 0;
++					int fxx = dw > 1 && sw > 1
++						  ? static_cast<int>(static_cast<int64_t>(dx + ox) * (sw - 1) * 65536 / (dw - 1))
++						  : 0;
++					int other[3];
++
++					sampleBilinear(rgb, sw, sh, fxx, fyy, other);
++					for (int ch = 0; ch < 3; ch++)
++						sum[ch] += other[ch];
++					count++;
++				}
++			}
++
++			int r = (sum[0] + count / 2) / count;
++			int g = (sum[1] + count / 2) / count;
++			int b = (sum[2] + count / 2) / count;
++
++			int u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
++			int v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
++
++			size_t index = static_cast<size_t>(dy / 2) * uvStride + dx;
++			if (nv21) {
++				uvPlane[index] = clamp8(v);
++				uvPlane[index + 1] = clamp8(u);
++			} else {
++				uvPlane[index] = clamp8(u);
++				uvPlane[index + 1] = clamp8(v);
++			}
++		}
++	}
++}
++
++} /* namespace */
++
++class SoftIspConverter : public Converter
++{
++public:
++	SoftIspConverter(MediaDevice *media);
++	~SoftIspConverter() override = default;
++
++	int loadConfiguration([[maybe_unused]] const std::string &filename) override
++	{
++		return 0;
++	}
++
++	bool isValid() const override { return valid_; }
++
++	std::vector<PixelFormat> formats(PixelFormat input) override;
++	SizeRange sizes(const Size &input) override;
++	std::tuple<unsigned int, unsigned int>
++	strideAndFrameSize(const PixelFormat &pixelFormat, const Size &size) override;
++
++	int configure(const StreamConfiguration &inputCfg,
++		      const std::vector<std::reference_wrapper<StreamConfiguration>> &outputCfgs) override;
++	int exportBuffers(unsigned int output, unsigned int count,
++			  std::vector<std::unique_ptr<FrameBuffer>> *buffers) override;
++
++	int start() override { return 0; }
++	void stop() override {}
++
++	int queueBuffers(FrameBuffer *input,
++			 const std::map<unsigned int, FrameBuffer *> &outputs) override;
++
++private:
++	int writeOutput(unsigned int index, FrameBuffer *output);
++
++	bool valid_ = false;
++	BayerOrder order_ = BayerOrder::Grbg;
++	Size inputSize_;
++	PixelFormat inputFormat_;
++	struct OutputConfig {
++		PixelFormat format;
++		Size size;
++	};
++	std::vector<OutputConfig> outputs_;
++	std::vector<uint8_t> rgb_;
++	RgbGains gains_;
++};
++
++SoftIspConverter::SoftIspConverter([[maybe_unused]] MediaDevice *media)
++	: Converter("softisp")
++{
++	valid_ = true;
++}
++
++std::vector<PixelFormat> SoftIspConverter::formats(PixelFormat input)
++{
++	BayerOrder order;
++
++	if (!bayerOrderFor(input, &order))
++		return {};
++
++	return { formats::NV12, formats::NV21 };
++}
++
++SizeRange SoftIspConverter::sizes(const Size &input)
++{
++	return SizeRange(Size(16, 16), input);
++}
++
++std::tuple<unsigned int, unsigned int>
++SoftIspConverter::strideAndFrameSize(const PixelFormat &pixelFormat,
++				     const Size &size)
++{
++	if (pixelFormat != formats::NV12 && pixelFormat != formats::NV21)
++		return std::make_tuple(0, 0);
++
++	unsigned int stride = (size.width + 15) & ~15u;
++
++	return std::make_tuple(stride, stride * size.height * 3 / 2);
++}
++
++int SoftIspConverter::configure(const StreamConfiguration &inputCfg,
++				const std::vector<std::reference_wrapper<StreamConfiguration>> &outputCfgs)
++{
++	if (!bayerOrderFor(inputCfg.pixelFormat, &order_)) {
++		LOG(SoftIsp, Error) << "Unsupported input format " << inputCfg.pixelFormat;
++		return -EINVAL;
++	}
++
++	if (inputCfg.size.width < 16 || inputCfg.size.height < 16) {
++		LOG(SoftIsp, Error) << "Input size too small: " << inputCfg.size;
++		return -EINVAL;
++	}
++
++	inputSize_ = inputCfg.size;
++	inputFormat_ = inputCfg.pixelFormat;
++	outputs_.clear();
++
++	for (const auto &cfgRef : outputCfgs) {
++		const StreamConfiguration &cfg = cfgRef;
++
++		if (cfg.pixelFormat != formats::NV12 && cfg.pixelFormat != formats::NV21) {
++			LOG(SoftIsp, Error) << "Unsupported output format " << cfg.pixelFormat;
++			return -EINVAL;
++		}
++
++		outputs_.push_back({ cfg.pixelFormat, cfg.size });
++	}
++
++	return 0;
++}
++
++int SoftIspConverter::exportBuffers(unsigned int output, unsigned int count,
++				    std::vector<std::unique_ptr<FrameBuffer>> *buffers)
++{
++	if (output >= outputs_.size())
++		return -EINVAL;
++
++	auto [stride, frameSize] = strideAndFrameSize(outputs_[output].format,
++						      outputs_[output].size);
++	if (!stride)
++		return -EINVAL;
++
++	DmaHeap heap;
++	if (!heap.isValid()) {
++		LOG(SoftIsp, Error) << "No DMA heap available";
++		return -EINVAL;
++	}
++
++	return heap.exportBuffers(count, { frameSize }, buffers, DmaHeap::System);
++}
++
++int SoftIspConverter::writeOutput(unsigned int index, FrameBuffer *output)
++{
++	if (index >= outputs_.size())
++		return -EINVAL;
++
++	const OutputConfig &cfg = outputs_[index];
++
++	MappedFrameBuffer out(output, MappedFrameBuffer::MapFlag::Write);
++	if (!out.isValid()) {
++		LOG(SoftIsp, Error) << "Failed to map output buffer";
++		return -EINVAL;
++	}
++
++	unsigned int yStride = output->planes()[0].stride;
++	if (!yStride)
++		yStride = cfg.size.width;
++
++	uint8_t *yPlane = out.planes()[0].data();
++	uint8_t *uvPlane;
++	unsigned int uvStride;
++
++	if (out.planes().size() > 1) {
++		uvPlane = out.planes()[1].data();
++		uvStride = output->planes()[1].stride;
++		if (!uvStride)
++			uvStride = yStride;
++	} else {
++		uvPlane = yPlane + static_cast<size_t>(yStride) * cfg.size.height;
++		uvStride = yStride;
++	}
++
++	scaleToNv12(rgb_, inputSize_, yPlane, yStride, uvPlane, uvStride,
++		    cfg.size, cfg.format == formats::NV21, gains_);
++
++	return 0;
++}
++
++int SoftIspConverter::queueBuffers(FrameBuffer *input,
++				   const std::map<unsigned int, FrameBuffer *> &outputs)
++{
++	int ret = 0;
++
++	if (outputs.empty()) {
++		LOG(SoftIsp, Error) << "No output buffer";
++		return -EINVAL;
++	}
++
++	if (!input || !input->planes().size()) {
++		LOG(SoftIsp, Error) << "No input buffer";
++		return -EINVAL;
++	}
++
++	/*
++	 * Demosaic the frame once, then produce every requested output from
++	 * the shared RGB image.
++	 */
++	MappedFrameBuffer in(input, MappedFrameBuffer::MapFlag::Read);
++	if (!in.isValid()) {
++		LOG(SoftIsp, Error) << "Failed to map input buffer";
++		return -EINVAL;
++	}
++
++	unsigned int inStride = input->planes()[0].stride;
++	if (!inStride)
++		inStride = inputSize_.width * 10 / 8;
++
++	debayer(in.planes()[0].data(), inStride, inputSize_.width,
++		inputSize_.height, order_, rgb_, gains_);
++
++	for (const auto &[index, output] : outputs) {
++		if (!output)
++			continue;
++
++		ret = writeOutput(index, output);
++		if (ret)
++			break;
++	}
++
++	/*
++	 * The input buffer is free again once conversion is done, and each
++	 * output buffer is ready to be completed.
++	 */
++	inputBufferReady.emit(input);
++
++	for (const auto &[index, output] : outputs) {
++		if (output)
++			outputBufferReady.emit(output);
++	}
++
++	return ret;
++}
++
++REGISTER_CONVERTER("softisp", SoftIspConverter, {})
++
++} /* namespace libcamera */

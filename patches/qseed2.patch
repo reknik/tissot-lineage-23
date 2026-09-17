@@ -1,0 +1,955 @@
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.c
+index bb4fd5fa4b22e85c364f764a0770a38f73a169f6..f5bd7b48300418d936c63e812677d1c086e8ce58 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_catalog.c
+@@ -185,6 +185,56 @@ static const uint32_t plane_formats_yuv[] = {
+ 	DRM_FORMAT_YVU420,
+ };
+ 
++/*
++ * Formats of the QSEED2 VIG pipes.  They are the same as plane_formats_yuv
++ * except that the 10-bit P010 format is left out: these pipes only have the
++ * 8-bit CSC block (no DPU_SSPP_CSC_10BIT), so 10-bit YUV cannot be
++ * converted correctly.
++ */
++static const uint32_t plane_formats_yuv_qseed2[] = {
++	DRM_FORMAT_ARGB8888,
++	DRM_FORMAT_ABGR8888,
++	DRM_FORMAT_RGBA8888,
++	DRM_FORMAT_BGRX8888,
++	DRM_FORMAT_BGRA8888,
++	DRM_FORMAT_ARGB2101010,
++	DRM_FORMAT_XRGB2101010,
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_XBGR8888,
++	DRM_FORMAT_RGBX8888,
++	DRM_FORMAT_RGB888,
++	DRM_FORMAT_BGR888,
++	DRM_FORMAT_RGB565,
++	DRM_FORMAT_BGR565,
++	DRM_FORMAT_ARGB1555,
++	DRM_FORMAT_ABGR1555,
++	DRM_FORMAT_RGBA5551,
++	DRM_FORMAT_BGRA5551,
++	DRM_FORMAT_XRGB1555,
++	DRM_FORMAT_XBGR1555,
++	DRM_FORMAT_RGBX5551,
++	DRM_FORMAT_BGRX5551,
++	DRM_FORMAT_ARGB4444,
++	DRM_FORMAT_ABGR4444,
++	DRM_FORMAT_RGBA4444,
++	DRM_FORMAT_BGRA4444,
++	DRM_FORMAT_XRGB4444,
++	DRM_FORMAT_XBGR4444,
++	DRM_FORMAT_RGBX4444,
++	DRM_FORMAT_BGRX4444,
++
++	DRM_FORMAT_NV12,
++	DRM_FORMAT_NV21,
++	DRM_FORMAT_NV16,
++	DRM_FORMAT_NV61,
++	DRM_FORMAT_VYUY,
++	DRM_FORMAT_UYVY,
++	DRM_FORMAT_YUYV,
++	DRM_FORMAT_YVYU,
++	DRM_FORMAT_YUV420,
++	DRM_FORMAT_YVU420,
++};
++
+ static const u32 rotation_v2_formats[] = {
+ 	DRM_FORMAT_NV12,
+ 	/* TODO add formats after validation */
+@@ -276,16 +326,21 @@ static const u32 wb2_formats_rgb_yuv[] = {
+ 	.num_formats = ARRAY_SIZE(plane_formats), \
+ 	}
+ 
+-/* qseed2 is not supported, so disabled scaling */
++/*
++ * QSEED2 scaler block.  It has no hardware version register, so
++ * scaler_blk.version stays zero and the QSEED2 code path is selected by
++ * DPU_SSPP_SCALER_QSEED2 instead.  VIG pipes are the video/image pipes and
++ * support the full YUV format list.
++ */
+ #define _VIG_SBLK_QSEED2() \
+ 	{ \
+ 	.scaler_blk = {.name = "scaler", \
+-		/* no version for qseed2 */ \
++		/* no version register on qseed2 */ \
+ 		.base = 0x200, .len = 0xa0,}, \
+ 	.csc_blk = {.name = "csc", \
+ 		.base = 0x320, .len = 0x100,}, \
+-	.format_list = plane_formats, \
+-	.num_formats = ARRAY_SIZE(plane_formats), \
++	.format_list = plane_formats_yuv_qseed2, \
++	.num_formats = ARRAY_SIZE(plane_formats_yuv_qseed2), \
+ 	.rotation_cfg = NULL, \
+ 	}
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c
+index d3da7000923435abe5fe2f7c046cc0cc153a8da4..64c58a22640731465e2fb16217c66a2b26dc68ec 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.c
+@@ -439,6 +439,70 @@ void dpu_hw_sspp_setup_scaler3(struct dpu_hw_sspp *ctx,
+ 			format);
+ }
+ 
++/*
++ * QSEED2 scaler programming.
++ *
++ * The QSEED2 block only implements the scaler configuration register at
++ * +0x04, the phase step registers at +0x10..+0x1c, the initial phase
++ * registers at +0x20..+0x2c and the sharpening block at +0x30.  There is
++ * no OP_MODE, preload, source/destination size or coefficient LUT
++ * register, so nothing outside that set may be written for these pipes.
++ *
++ * Sources:
++ *  - the in-tree mdp5 description of the same block
++ *    (drivers/gpu/drm/msm/registers/display/mdp5.xml: SCALE_CONFIG with
++ *    SCALEX_EN/SCALEY_EN at bit 0/1 and the per-component G/Y, CrCb and
++ *    alpha filters at bits 8/12/16 and 10/14/18),
++ *  - dpu_hw_scaler2_pack_regs() in dpu_hw_util.h, and
++ *  - Qualcomm's downstream mdss_mdp_qseed2_setup() and
++ *    mdss_mdp_pipe_position_update() (mdss_mdp_pp.c / mdss_mdp_pipe.c).
++ */
++void dpu_hw_sspp_setup_scaler2(struct dpu_hw_sspp *ctx,
++		struct dpu_hw_scaler2_cfg *scaler2_cfg)
++{
++	u32 decimation;
++
++	if (!ctx || !scaler2_cfg)
++		return;
++
++	dpu_hw_setup_scaler2(&ctx->hw, scaler2_cfg,
++			ctx->cap->sblk->scaler_blk.base);
++
++	/*
++	 * QSEED2 has a decimation block in front of the filtered scaler.
++	 * The horizontal/vertical fields hold a bitmask of the pixels that
++	 * are dropped, i.e. (1 << exponent) - 1: one pixel for 2x, three
++	 * for 4x, and so on.
++	 */
++	decimation = ((1 << scaler2_cfg->horz_decimate) - 1) << 8;
++	decimation |= (1 << scaler2_cfg->vert_decimate) - 1;
++	DPU_REG_WRITE(&ctx->hw, SSPP_DECIMATION_CONFIG, decimation);
++}
++
++/*
++ * QSEED2 sharpening block: four consecutive registers holding the
++ * sharpening strength and the edge, smooth and noise thresholds
++ * (downstream pp_sharp_config(), mdss_mdp_pp.c).
++ *
++ * The callback is wired up but intentionally never invoked: no DRM plane
++ * property exposes sharpening, so there is no caller and no automatic
++ * policy for it yet.
++ */
++void dpu_hw_sspp_setup_sharpening(struct dpu_hw_sspp *ctx,
++		struct dpu_hw_sharp_cfg *cfg)
++{
++	u32 offset;
++
++	if (!ctx || !cfg)
++		return;
++
++	offset = ctx->cap->sblk->scaler_blk.base + DPU_QSEED2_SHARP_OFFSET;
++	DPU_REG_WRITE(&ctx->hw, offset + 0x0, cfg->strength);
++	DPU_REG_WRITE(&ctx->hw, offset + 0x4, cfg->edge_thr);
++	DPU_REG_WRITE(&ctx->hw, offset + 0x8, cfg->smooth_thr);
++	DPU_REG_WRITE(&ctx->hw, offset + 0xc, cfg->noise_thr);
++}
++
+ /*
+  * dpu_hw_sspp_setup_rects()
+  */
+@@ -649,6 +713,32 @@ static void _setup_layer_ops(struct dpu_hw_sspp *c,
+ 		test_bit(DPU_SSPP_SMART_DMA_V2, &c->cap->features))
+ 		c->ops.setup_multirect = dpu_hw_sspp_setup_multirect;
+ 
++	/*
++	 * QSEED2 is the scaler on the DPU 1.x VIG pipes (msm8917, msm8937,
++	 * msm8953, msm8996).  It shares the QSEED3 register *addresses* from
++	 * +0x04 onwards but not their meaning: the register at +0x04 is
++	 * SCALE_CONFIG (SCALEX_EN bit 0, SCALEY_EN bit 1 and the G/Y, CrCb
++	 * and alpha filter selectors in bits 8/12/16 and 10/14/18) rather
++	 * than QSEED3's OP_MODE, and there is no preload, source/destination
++	 * size, OP_MODE or coefficient LUT register.
++	 *
++	 * Programming the QSEED3 sequence at the QSEED2 block was tried
++	 * before and made the pipe stop signalling CTL flush completion
++	 * (vblank timeout / "wait for commit done returned -110") with a
++	 * blue line artefact over the navigation controls.  QSEED2 therefore
++	 * gets its own configuration and programming routine
++	 * (dpu_hw_sspp_setup_scaler2()) and must never be wired to
++	 * dpu_hw_sspp_setup_scaler3().
++	 *
++	 * See dpu_hw_scaler2_cfg in dpu_hw_util.h for the register layout and
++	 * its sources (registers/display/mdp5.xml and Qualcomm's downstream
++	 * mdss_mdp_qseed2_setup()).
++	 */
++	if (test_bit(DPU_SSPP_SCALER_QSEED2, &features)) {
++		c->ops.setup_scaler2 = dpu_hw_sspp_setup_scaler2;
++		c->ops.setup_sharpening = dpu_hw_sspp_setup_sharpening;
++	}
++
+ 	if (test_bit(DPU_SSPP_SCALER_QSEED3_COMPATIBLE, &features))
+ 		c->ops.setup_scaler = dpu_hw_sspp_setup_scaler3;
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h
+index 69d68cc916b2e6f068cfc5c1ece4b11511b64e53..0b9c19c948c0831d418a18b7b2656cf0edff7ecc 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_sspp.h
+@@ -285,6 +285,14 @@ struct dpu_hw_sspp_ops {
+ 		struct dpu_hw_scaler3_cfg *scaler3_cfg,
+ 		const struct msm_format *format);
+ 
++	/**
++	 * @setup_scaler2: setup the QSEED2 scaler
++	 * @ctx: Pointer to pipe context
++	 * @scaler2_cfg: Pointer to QSEED2 configuration
++	 */
++	void (*setup_scaler2)(struct dpu_hw_sspp *ctx,
++		struct dpu_hw_scaler2_cfg *scaler2_cfg);
++
+ 	/**
+ 	 * @setup_cdp: setup client driven prefetch
+ 	 * @pipe: Pointer to software pipe context
+@@ -321,6 +329,22 @@ struct dpu_hw_sspp {
+ 	struct dpu_hw_sspp_ops ops;
+ };
+ 
++/**
++ * dpu_sspp_has_scaler - does this SSPP have a usable hardware scaler?
++ * @sspp: SSPP to test
++ *
++ * QSEED2 and QSEED3-compatible pipes both provide scaling, through
++ * different operations.  Resource reservation and plane validation must
++ * accept either one without pretending QSEED2 is QSEED3.
++ */
++static inline bool dpu_sspp_has_scaler(const struct dpu_hw_sspp *sspp)
++{
++	if (!sspp || !sspp->cap->sblk->scaler_blk.len)
++		return false;
++
++	return sspp->ops.setup_scaler || sspp->ops.setup_scaler2;
++}
++
+ struct dpu_kms;
+ 
+ struct dpu_hw_sspp *dpu_hw_sspp_init(struct drm_device *dev,
+@@ -342,6 +366,12 @@ void dpu_hw_sspp_setup_scaler3(struct dpu_hw_sspp *ctx,
+ 			       struct dpu_hw_scaler3_cfg *scaler3_cfg,
+ 			       const struct msm_format *format);
+ 
++void dpu_hw_sspp_setup_scaler2(struct dpu_hw_sspp *ctx,
++			       struct dpu_hw_scaler2_cfg *scaler2_cfg);
++
++void dpu_hw_sspp_setup_sharpening(struct dpu_hw_sspp *ctx,
++				  struct dpu_hw_sharp_cfg *cfg);
++
+ void dpu_hw_sspp_setup_csc(struct dpu_hw_sspp *ctx,
+ 			   const struct dpu_csc_cfg *data);
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.c
+index c7a5f4a0d05419b40fdb76fff0ce40c5315df199..a185a615dd59a4c39c992d44c29e550a24e91890 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.c
+@@ -388,6 +388,54 @@ void dpu_hw_setup_scaler3(struct dpu_hw_blk_reg_map *c,
+ 	DPU_REG_WRITE(c, QSEED3_OP_MODE + scaler_offset, op_mode);
+ }
+ 
++/*
++ * QSEED2 register offsets, relative to the scaler block base.  The block
++ * reuses the VIG operation mode register at +0x00 and the QSEED3 register
++ * addresses from +0x04 onwards, but with an unrelated QSEED2 layout; see
++ * the struct dpu_hw_scaler2_cfg documentation in dpu_hw_util.h.
++ */
++#define QSEED2_SCALE_CONFIG		0x04
++#define QSEED2_PHASE_STEP_C03_X		0x10
++#define QSEED2_PHASE_STEP_C03_Y		0x14
++#define QSEED2_PHASE_STEP_C12_X		0x18
++#define QSEED2_PHASE_STEP_C12_Y		0x1c
++#define QSEED2_INIT_PHASE_C03_X		0x20
++#define QSEED2_INIT_PHASE_C03_Y		0x24
++#define QSEED2_INIT_PHASE_C12_X		0x28
++#define QSEED2_INIT_PHASE_C12_Y		0x2c
++
++void dpu_hw_setup_scaler2(struct dpu_hw_blk_reg_map *c,
++		const struct dpu_hw_scaler2_cfg *scaler2_cfg,
++		u32 scaler_offset)
++{
++	struct dpu_hw_scaler2_regs regs;
++
++	dpu_hw_scaler2_pack_regs(scaler2_cfg, &regs);
++
++	/*
++	 * Program the phase values and filters first and enable the scaler
++	 * in SCALE_CONFIG last.  A disabled scaler writes zeroes, which is
++	 * the clean way to turn a previously active scaler off.
++	 */
++	DPU_REG_WRITE(c, QSEED2_PHASE_STEP_C03_X + scaler_offset,
++		      regs.phase_step_c03_x);
++	DPU_REG_WRITE(c, QSEED2_PHASE_STEP_C03_Y + scaler_offset,
++		      regs.phase_step_c03_y);
++	DPU_REG_WRITE(c, QSEED2_PHASE_STEP_C12_X + scaler_offset,
++		      regs.phase_step_c12_x);
++	DPU_REG_WRITE(c, QSEED2_PHASE_STEP_C12_Y + scaler_offset,
++		      regs.phase_step_c12_y);
++	DPU_REG_WRITE(c, QSEED2_INIT_PHASE_C03_X + scaler_offset,
++		      regs.init_phase_c03_x);
++	DPU_REG_WRITE(c, QSEED2_INIT_PHASE_C03_Y + scaler_offset,
++		      regs.init_phase_c03_y);
++	DPU_REG_WRITE(c, QSEED2_INIT_PHASE_C12_X + scaler_offset,
++		      regs.init_phase_c12_x);
++	DPU_REG_WRITE(c, QSEED2_INIT_PHASE_C12_Y + scaler_offset,
++		      regs.init_phase_c12_y);
++	DPU_REG_WRITE(c, QSEED2_SCALE_CONFIG + scaler_offset, regs.config);
++}
++
+ void dpu_hw_csc_setup(struct dpu_hw_blk_reg_map *c,
+ 		u32 csc_reg_off,
+ 		const struct dpu_csc_cfg *data, bool csc10)
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.h
+index 628befc65ce35eae15aa7e1ceb4976fcbe412db8..6cef5dc8ef3c22156e593afeebf4653feef6de58 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_util.h
+@@ -8,7 +8,9 @@
+ #define _DPU_HW_UTIL_H
+ 
+ #include <linux/io.h>
++#include <linux/math.h>
+ #include <linux/slab.h>
++#include <linux/string.h>
+ #include "dpu_hw_mdss.h"
+ #include "dpu_hw_catalog.h"
+ 
+@@ -163,6 +165,349 @@ struct dpu_hw_scaler3_cfg {
+ 	u32 dir_weight;
+ };
+ 
++/*
++ * QSEED2 scaler (DPU 1.x VIG pipes: msm8917, msm8937, msm8953, msm8996).
++ *
++ * QSEED2 is a different algorithm from QSEED3 and shares neither its
++ * register layout nor its bit-field encoding, so it has its own
++ * configuration structure, helpers and programming routine instead of
++ * being routed through the QSEED3 code.
++ *
++ * Register offsets, bit layouts and semantics below come from the in-tree
++ * mdp5 register description of the same block
++ * (drivers/gpu/drm/msm/registers/display/mdp5.xml) and were cross-checked
++ * against Qualcomm's downstream mdss_mdp_qseed2_setup() in
++ * drivers/video/fbdev/msm/mdss_mdp_pp.c.
++ */
++#define DPU_QSEED2_PHASE_STEP_SHIFT	21
++/* phase step and initial phase are 26-bit (25:0) fixed point registers */
++#define DPU_QSEED2_PHASE_MASK		GENMASK(25, 0)
++/* maximum reduction the filtered (BIL/PCMN) scaler can do in one step */
++#define DPU_QSEED2_MAX_DOWNSCALE	4
++#define DPU_QSEED2_MAX_UPSCALE		20
++/* SCALE_CONFIG filter selectors */
++#define DPU_QSEED2_FILTER_NEAREST	0
++#define DPU_QSEED2_FILTER_BIL		1
++#define DPU_QSEED2_FILTER_PCMN		2
++#define DPU_QSEED2_FILTER_CA		3
++/* sharpening block offset, relative to the scaler block base */
++#define DPU_QSEED2_SHARP_OFFSET		0x30
++
++/*
++ * Component indices of the QSEED2 phase registers.  They intentionally
++ * match DPU_SSPP_COMP_* in dpu_hw_sspp.h, which cannot be included here
++ * because that header includes this one.
++ */
++#define DPU_QSEED2_COMP_0		0
++#define DPU_QSEED2_COMP_1_2		1
++#define DPU_QSEED2_COMP_2		2
++#define DPU_QSEED2_COMP_3		3
++
++#define DPU_QSEED2_DECIMATED_DIM(dim, deci) \
++	(((dim) + ((1 << (deci)) - 1)) >> (deci))
++
++/**
++ * struct dpu_hw_scaler2_cfg : QSEEDv2 configuration
++ * @enable:            master scaler enable
++ * @scale_x:           program horizontal scaling (SCALEX_EN)
++ * @scale_y:           program vertical scaling (SCALEY_EN)
++ * @init_phase_x:      horizontal initial phase per component
++ * @phase_step_x:      horizontal phase step per component
++ * @init_phase_y:      vertical initial phase per component
++ * @phase_step_y:      vertical phase step per component
++ * @src_width:         post-decimation source width per component
++ * @src_height:        post-decimation source height per component
++ * @dst_width:         destination width
++ * @dst_height:        destination height
++ * @horz_filter_y_rgb: horizontal G/Y filter configuration
++ * @horz_filter_uv:    horizontal CrCb filter configuration
++ * @horz_filter_alpha: horizontal alpha filter configuration
++ * @vert_filter_y_rgb: vertical G/Y filter configuration
++ * @vert_filter_uv:    vertical CrCb filter configuration
++ * @vert_filter_alpha: vertical alpha filter configuration
++ * @horz_decimate:     horizontal decimation exponent (0 disables)
++ * @vert_decimate:     vertical decimation exponent (0 disables)
++ */
++struct dpu_hw_scaler2_cfg {
++	u32 enable;
++	u32 scale_x;
++	u32 scale_y;
++
++	int32_t init_phase_x[DPU_MAX_PLANES];
++	int32_t phase_step_x[DPU_MAX_PLANES];
++	int32_t init_phase_y[DPU_MAX_PLANES];
++	int32_t phase_step_y[DPU_MAX_PLANES];
++
++	u32 src_width[DPU_MAX_PLANES];
++	u32 src_height[DPU_MAX_PLANES];
++
++	u32 dst_width;
++	u32 dst_height;
++
++	u32 horz_filter_y_rgb;
++	u32 horz_filter_uv;
++	u32 horz_filter_alpha;
++	u32 vert_filter_y_rgb;
++	u32 vert_filter_uv;
++	u32 vert_filter_alpha;
++
++	u32 horz_decimate;
++	u32 vert_decimate;
++};
++
++/**
++ * struct dpu_hw_scaler2_regs : packed QSEED2 scaler register values
++ * @config:           SCALE_CONFIG (scaler base + 0x04)
++ * @phase_step_c03_x: component 0/3 horizontal phase step (+ 0x10)
++ * @phase_step_c03_y: component 0/3 vertical phase step (+ 0x14)
++ * @phase_step_c12_x: component 1/2 horizontal phase step (+ 0x18)
++ * @phase_step_c12_y: component 1/2 vertical phase step (+ 0x1c)
++ * @init_phase_c03_x: component 0/3 horizontal initial phase (+ 0x20)
++ * @init_phase_c03_y: component 0/3 vertical initial phase (+ 0x24)
++ * @init_phase_c12_x: component 1/2 horizontal initial phase (+ 0x28)
++ * @init_phase_c12_y: component 1/2 vertical initial phase (+ 0x2c)
++ */
++struct dpu_hw_scaler2_regs {
++	u32 config;
++	u32 phase_step_c03_x;
++	u32 phase_step_c03_y;
++	u32 phase_step_c12_x;
++	u32 phase_step_c12_y;
++	u32 init_phase_c03_x;
++	u32 init_phase_c03_y;
++	u32 init_phase_c12_x;
++	u32 init_phase_c12_y;
++};
++
++/**
++ * dpu_hw_scaler2_calc_phase_step - calculate a QSEED2 phase step
++ * @src: source dimension
++ * @dst: destination dimension
++ * @out: output phase step
++ *
++ * QSEED2 phase steps are 26-bit fixed point values with 21 fractional
++ * bits, which leaves five integer bits: the filtered scaler can reduce
++ * the source by at most DPU_QSEED2_MAX_DOWNSCALE in a single step.
++ * Larger ratios have to be brought into range by the decimation block
++ * before this is called.
++ *
++ * Returns 0 on success, -EOVERFLOW when the ratio is still beyond the
++ * filtered scaler limit and -EINVAL for empty dimensions.
++ */
++static inline int dpu_hw_scaler2_calc_phase_step(u32 src, u32 dst, u32 *out)
++{
++	if (!src || !dst)
++		return -EINVAL;
++
++	if (src > dst * DPU_QSEED2_MAX_DOWNSCALE)
++		return -EOVERFLOW;
++
++	*out = mult_frac(1 << DPU_QSEED2_PHASE_STEP_SHIFT, src, dst);
++
++	return 0;
++}
++
++/**
++ * dpu_hw_scaler2_calc_decimation - pick the smallest decimation exponent
++ * @src: source dimension
++ * @dst: destination dimension
++ * @max_exp: maximum exponent supported by the platform
++ *
++ * Returns the smallest power-of-two exponent whose decimated source still
++ * satisfies the filtered scaler limit, capped at @max_exp.  Callers must
++ * still verify the result with dpu_hw_scaler2_calc_phase_step(): when the
++ * cap was reached and the ratio is still out of range the layer is not
++ * scaler-assignable.
++ */
++static inline u32 dpu_hw_scaler2_calc_decimation(u32 src, u32 dst,
++						 u32 max_exp)
++{
++	u32 exp = 0;
++
++	if (!dst)
++		return max_exp;
++
++	while (exp < max_exp &&
++	       DPU_QSEED2_DECIMATED_DIM(src, exp) >
++			dst * DPU_QSEED2_MAX_DOWNSCALE)
++		exp++;
++
++	return exp;
++}
++
++/**
++ * dpu_hw_scaler2_build_cfg - build a QSEED2 configuration from plane geometry
++ * @src_w: source width
++ * @src_h: source height
++ * @dst_w: destination width
++ * @dst_h: destination height
++ * @hsub:  horizontal chroma subsampling factor (1 for RGB)
++ * @vsub:  vertical chroma subsampling factor (1 for RGB)
++ * @yuv:   whether the source format is YUV
++ * @max_hdeci_exp: platform horizontal decimation exponent cap
++ * @max_vdeci_exp: platform vertical decimation exponent cap
++ * @cfg:   configuration to fill in
++ *
++ * Calculates the decimation exponents, 26-bit phase steps (component 0/3
++ * from the luma/RGB ratio, component 1/2 from the chroma-subsampled
++ * ratio) and the per-axis filters (bilinear for enlargement, PCMN for
++ * reduction).  Initial phase is left at zero for ordinary DRM atomic
++ * states.
++ *
++ * Returns 0 on success or a negative errno when the geometry cannot be
++ * handled by QSEED2 even with decimation.
++ */
++static inline int dpu_hw_scaler2_build_cfg(u32 src_w, u32 src_h,
++					   u32 dst_w, u32 dst_h,
++					   u32 hsub, u32 vsub, bool yuv,
++					   u32 max_hdeci_exp,
++					   u32 max_vdeci_exp,
++					   struct dpu_hw_scaler2_cfg *cfg)
++{
++	u32 src_w_dec, src_h_dec;
++	u32 phase_step_x, phase_step_y;
++	u32 chroma_div_x, chroma_div_y;
++	int ret;
++
++	memset(cfg, 0, sizeof(*cfg));
++
++	if (!src_w || !src_h || !dst_w || !dst_h)
++		return -EINVAL;
++
++	if (!hsub)
++		hsub = 1;
++	if (!vsub)
++		vsub = 1;
++
++	cfg->horz_decimate = dpu_hw_scaler2_calc_decimation(src_w, dst_w,
++							    max_hdeci_exp);
++	cfg->vert_decimate = dpu_hw_scaler2_calc_decimation(src_h, dst_h,
++							    max_vdeci_exp);
++
++	src_w_dec = DPU_QSEED2_DECIMATED_DIM(src_w, cfg->horz_decimate);
++	src_h_dec = DPU_QSEED2_DECIMATED_DIM(src_h, cfg->vert_decimate);
++
++	ret = dpu_hw_scaler2_calc_phase_step(src_w_dec, dst_w, &phase_step_x);
++	if (ret)
++		return ret;
++
++	ret = dpu_hw_scaler2_calc_phase_step(src_h_dec, dst_h, &phase_step_y);
++	if (ret)
++		return ret;
++
++	/*
++	 * Chroma planes are subsampled with respect to luma, so their phase
++	 * step is smaller by the subsampling factor.  When the decimation
++	 * block is active it drops a chroma sample instead of subsampling
++	 * it, in which case the luma phase step applies as-is.
++	 */
++	chroma_div_x = (yuv && !cfg->horz_decimate) ? hsub : 1;
++	chroma_div_y = (yuv && !cfg->vert_decimate) ? vsub : 1;
++
++	cfg->phase_step_x[DPU_QSEED2_COMP_0] = phase_step_x;
++	cfg->phase_step_y[DPU_QSEED2_COMP_0] = phase_step_y;
++	cfg->phase_step_x[DPU_QSEED2_COMP_3] = phase_step_x;
++	cfg->phase_step_y[DPU_QSEED2_COMP_3] = phase_step_y;
++	cfg->phase_step_x[DPU_QSEED2_COMP_2] =
++		cfg->phase_step_x[DPU_QSEED2_COMP_1_2] =
++			phase_step_x / chroma_div_x;
++	cfg->phase_step_y[DPU_QSEED2_COMP_2] =
++		cfg->phase_step_y[DPU_QSEED2_COMP_1_2] =
++			phase_step_y / chroma_div_y;
++
++	cfg->src_width[DPU_QSEED2_COMP_0] = src_w_dec;
++	cfg->src_height[DPU_QSEED2_COMP_0] = src_h_dec;
++	cfg->src_width[DPU_QSEED2_COMP_3] = src_w_dec;
++	cfg->src_height[DPU_QSEED2_COMP_3] = src_h_dec;
++	cfg->src_width[DPU_QSEED2_COMP_2] =
++		cfg->src_width[DPU_QSEED2_COMP_1_2] = src_w_dec / chroma_div_x;
++	cfg->src_height[DPU_QSEED2_COMP_2] =
++		cfg->src_height[DPU_QSEED2_COMP_1_2] = src_h_dec / chroma_div_y;
++
++	cfg->dst_width = dst_w;
++	cfg->dst_height = dst_h;
++
++	cfg->horz_filter_y_rgb = (src_w_dec <= dst_w) ?
++		DPU_QSEED2_FILTER_BIL : DPU_QSEED2_FILTER_PCMN;
++	cfg->horz_filter_alpha = cfg->horz_filter_y_rgb;
++	cfg->horz_filter_uv = (cfg->src_width[DPU_QSEED2_COMP_1_2] <= dst_w) ?
++		DPU_QSEED2_FILTER_BIL : DPU_QSEED2_FILTER_PCMN;
++
++	cfg->vert_filter_y_rgb = (src_h_dec <= dst_h) ?
++		DPU_QSEED2_FILTER_BIL : DPU_QSEED2_FILTER_PCMN;
++	cfg->vert_filter_alpha = cfg->vert_filter_y_rgb;
++	cfg->vert_filter_uv = (cfg->src_height[DPU_QSEED2_COMP_1_2] <= dst_h) ?
++		DPU_QSEED2_FILTER_BIL : DPU_QSEED2_FILTER_PCMN;
++
++	/* there is no chroma plane for RGB formats, so leave it unselected */
++	if (!yuv) {
++		cfg->horz_filter_uv = DPU_QSEED2_FILTER_NEAREST;
++		cfg->vert_filter_uv = DPU_QSEED2_FILTER_NEAREST;
++	}
++
++	/*
++	 * QSEED2 also performs chroma upsampling, so a YUV layer at unity
++	 * luma size still needs the scaler when chroma is subsampled.
++	 */
++	cfg->scale_x = (src_w_dec != dst_w) || (yuv && hsub > 1);
++	cfg->scale_y = (src_h_dec != dst_h) || (yuv && vsub > 1);
++	cfg->enable = cfg->scale_x || cfg->scale_y;
++
++	return 0;
++}
++
++/**
++ * dpu_hw_scaler2_pack_regs - pack a QSEED2 configuration into registers
++ * @cfg:  configuration to pack
++ * @regs: packed register values
++ *
++ * A disabled scaler packs every register as zero so that turning scaling
++ * off is a clean transition.  The SCALE_CONFIG layout used here is the
++ * mdp5 one: BIT(0)/BIT(1) enable the
++ * horizontal/vertical scaler and the G/Y, CrCb and alpha filter selectors
++ * live in bits 8/12/16 (horizontal) and 10/14/18 (vertical).
++ */
++static inline void dpu_hw_scaler2_pack_regs(const struct dpu_hw_scaler2_cfg *cfg,
++					    struct dpu_hw_scaler2_regs *regs)
++{
++	memset(regs, 0, sizeof(*regs));
++
++	if (!cfg->enable)
++		return;
++
++	if (cfg->scale_x) {
++		regs->config |= BIT(0);
++		regs->config |= (cfg->horz_filter_y_rgb & 0x3) << 8;
++		regs->config |= (cfg->horz_filter_uv & 0x3) << 12;
++		regs->config |= (cfg->horz_filter_alpha & 0x3) << 16;
++	}
++
++	if (cfg->scale_y) {
++		regs->config |= BIT(1);
++		regs->config |= (cfg->vert_filter_y_rgb & 0x3) << 10;
++		regs->config |= (cfg->vert_filter_uv & 0x3) << 14;
++		regs->config |= (cfg->vert_filter_alpha & 0x3) << 18;
++	}
++
++	regs->phase_step_c03_x =
++		cfg->phase_step_x[DPU_QSEED2_COMP_0] & DPU_QSEED2_PHASE_MASK;
++	regs->phase_step_c03_y =
++		cfg->phase_step_y[DPU_QSEED2_COMP_0] & DPU_QSEED2_PHASE_MASK;
++	regs->phase_step_c12_x =
++		cfg->phase_step_x[DPU_QSEED2_COMP_1_2] & DPU_QSEED2_PHASE_MASK;
++	regs->phase_step_c12_y =
++		cfg->phase_step_y[DPU_QSEED2_COMP_1_2] & DPU_QSEED2_PHASE_MASK;
++
++	regs->init_phase_c03_x =
++		cfg->init_phase_x[DPU_QSEED2_COMP_0] & DPU_QSEED2_PHASE_MASK;
++	regs->init_phase_c03_y =
++		cfg->init_phase_y[DPU_QSEED2_COMP_0] & DPU_QSEED2_PHASE_MASK;
++	regs->init_phase_c12_x =
++		cfg->init_phase_x[DPU_QSEED2_COMP_1_2] & DPU_QSEED2_PHASE_MASK;
++	regs->init_phase_c12_y =
++		cfg->init_phase_y[DPU_QSEED2_COMP_1_2] & DPU_QSEED2_PHASE_MASK;
++}
++
+ /**
+  * struct dpu_drm_pix_ext_v1 - version 1 of pixel ext structure
+  * @num_ext_pxls_lr: Number of total horizontal pixels
+@@ -353,6 +698,10 @@ void dpu_hw_setup_scaler3(struct dpu_hw_blk_reg_map *c,
+ 		u32 scaler_offset, u32 scaler_version,
+ 		const struct msm_format *format);
+ 
++void dpu_hw_setup_scaler2(struct dpu_hw_blk_reg_map *c,
++		const struct dpu_hw_scaler2_cfg *scaler2_cfg,
++		u32 scaler_offset);
++
+ void dpu_hw_csc_setup(struct dpu_hw_blk_reg_map  *c,
+ 		u32 csc_reg_off,
+ 		const struct dpu_csc_cfg *data, bool csc10);
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+index 3c315d5805b81462e55ade8a8d3da22878d6959d..7ffb9bcc796040af59bfe394aa8cd69d3780b417 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_plane.c
+@@ -525,22 +525,126 @@ static const struct dpu_csc_cfg *_dpu_plane_get_csc(struct dpu_sw_pipe *pipe,
+ 	return csc_ptr;
+ }
+ 
+-static void _dpu_plane_setup_scaler(struct dpu_sw_pipe *pipe,
++/*
++ * QSEED2 pixel extension.
++ *
++ * MDP5 does the same thing for the same hardware: there is no left/top
++ * extension, one pixel is repeated on the right/bottom edge whenever that
++ * axis is filtered, and the requested-pixel count is the (decimated)
++ * source size plus that repeated pixel.  Chroma components use their
++ * subsampled dimensions, which
++ * dpu_hw_scaler2_build_cfg() has already stored in src_width/src_height.
++ */
++static void _dpu_plane_setup_scaler2_pixel_ext(const struct dpu_hw_scaler2_cfg *scaler2_cfg,
++					       struct dpu_hw_pixel_ext *pixel_ext)
++{
++	int i;
++
++	for (i = 0; i < DPU_MAX_PLANES; i++) {
++		pixel_ext->roi_w[i] = scaler2_cfg->src_width[i];
++		pixel_ext->roi_h[i] = scaler2_cfg->src_height[i];
++
++		pixel_ext->init_phase_x[i] = scaler2_cfg->init_phase_x[i];
++		pixel_ext->init_phase_y[i] = scaler2_cfg->init_phase_y[i];
++		pixel_ext->phase_step_x[i] = scaler2_cfg->phase_step_x[i];
++		pixel_ext->phase_step_y[i] = scaler2_cfg->phase_step_y[i];
++
++		pixel_ext->num_ext_pxls_left[i] = 0;
++		pixel_ext->num_ext_pxls_top[i] = 0;
++		pixel_ext->num_ext_pxls_right[i] = scaler2_cfg->scale_x ? 1 : 0;
++		pixel_ext->num_ext_pxls_btm[i] = scaler2_cfg->scale_y ? 1 : 0;
++
++		pixel_ext->left_rpt[i] = 0;
++		pixel_ext->top_rpt[i] = 0;
++		pixel_ext->right_rpt[i] = scaler2_cfg->scale_x ? 1 : 0;
++		pixel_ext->btm_rpt[i] = scaler2_cfg->scale_y ? 1 : 0;
++
++		pixel_ext->left_ftch[i] = 0;
++		pixel_ext->right_ftch[i] = 0;
++		pixel_ext->top_ftch[i] = 0;
++		pixel_ext->btm_ftch[i] = 0;
++
++		if (i == DPU_SSPP_COMP_1_2 || i == DPU_SSPP_COMP_2) {
++			pixel_ext->horz_filter[i] = scaler2_cfg->horz_filter_uv;
++			pixel_ext->vert_filter[i] = scaler2_cfg->vert_filter_uv;
++		} else {
++			pixel_ext->horz_filter[i] = scaler2_cfg->horz_filter_y_rgb;
++			pixel_ext->vert_filter[i] = scaler2_cfg->vert_filter_y_rgb;
++		}
++	}
++}
++
++static int _dpu_plane_build_scaler2_cfg(struct dpu_plane *pdpu,
++		const struct msm_format *fmt,
++		const struct dpu_sw_pipe_cfg *pipe_cfg,
++		struct dpu_hw_scaler2_cfg *scaler2_cfg,
++		struct dpu_hw_pixel_ext *pixel_ext)
++{
++	const struct drm_format_info *info = drm_format_info(fmt->pixel_format);
++	int ret;
++
++	ret = dpu_hw_scaler2_build_cfg(drm_rect_width(&pipe_cfg->src_rect),
++				       drm_rect_height(&pipe_cfg->src_rect),
++				       drm_rect_width(&pipe_cfg->dst_rect),
++				       drm_rect_height(&pipe_cfg->dst_rect),
++				       info->hsub, info->vsub,
++				       MSM_FORMAT_IS_YUV(fmt),
++				       pdpu->catalog->caps->max_hdeci_exp,
++				       pdpu->catalog->caps->max_vdeci_exp,
++				       scaler2_cfg);
++	if (ret)
++		return ret;
++
++	_dpu_plane_setup_scaler2_pixel_ext(scaler2_cfg, pixel_ext);
++
++	return 0;
++}
++
++static void _dpu_plane_setup_scaler(struct dpu_plane *pdpu,
++		struct dpu_sw_pipe *pipe,
+ 		const struct msm_format *fmt, bool color_fill,
+ 		struct dpu_sw_pipe_cfg *pipe_cfg)
+ {
+ 	struct dpu_hw_sspp *pipe_hw = pipe->sspp;
+ 	const struct drm_format_info *info = drm_format_info(fmt->pixel_format);
+ 	struct dpu_hw_scaler3_cfg scaler3_cfg;
++	struct dpu_hw_scaler2_cfg scaler2_cfg;
+ 	struct dpu_hw_pixel_ext pixel_ext;
+ 	u32 src_width = drm_rect_width(&pipe_cfg->src_rect);
+ 	u32 src_height = drm_rect_height(&pipe_cfg->src_rect);
+ 	u32 dst_width = drm_rect_width(&pipe_cfg->dst_rect);
+ 	u32 dst_height = drm_rect_height(&pipe_cfg->dst_rect);
+ 
+-	memset(&scaler3_cfg, 0, sizeof(scaler3_cfg));
+ 	memset(&pixel_ext, 0, sizeof(pixel_ext));
+ 
++	/*
++	 * QSEED2 and QSEED3-compatible pipes use unrelated scaler
++	 * configurations and register layouts, so build the one that
++	 * matches this pipe.
++	 */
++	if (pipe_hw->ops.setup_scaler2) {
++		memset(&scaler2_cfg, 0, sizeof(scaler2_cfg));
++
++		if (_dpu_plane_build_scaler2_cfg(pdpu, fmt, pipe_cfg,
++						 &scaler2_cfg, &pixel_ext)) {
++			DPU_ERROR_PLANE(pdpu, "invalid QSEED2 scaling "
++					DRM_RECT_FMT " -> " DRM_RECT_FMT "\n",
++					DRM_RECT_ARG(&pipe_cfg->src_rect),
++					DRM_RECT_ARG(&pipe_cfg->dst_rect));
++			return;
++		}
++
++		if (pipe_hw->ops.setup_pe)
++			pipe_hw->ops.setup_pe(pipe_hw, &pixel_ext);
++
++		if (pipe->multirect_index != DPU_SSPP_RECT_1)
++			pipe_hw->ops.setup_scaler2(pipe_hw, &scaler2_cfg);
++
++		return;
++	}
++
++	memset(&scaler3_cfg, 0, sizeof(scaler3_cfg));
++
+ 	/* don't chroma subsample if decimating */
+ 	/* update scaler. calculate default config for QSEED3 */
+ 	_dpu_plane_setup_scaler3(pipe_hw,
+@@ -602,7 +706,8 @@ static void _dpu_plane_color_fill_pipe(struct dpu_plane_state *pstate,
+ 	if (pipe->sspp->ops.setup_rects)
+ 		pipe->sspp->ops.setup_rects(pipe, &pipe_cfg);
+ 
+-	_dpu_plane_setup_scaler(pipe, fmt, true, &pipe_cfg);
++	_dpu_plane_setup_scaler(to_dpu_plane(pstate->base.plane),
++				pipe, fmt, true, &pipe_cfg);
+ }
+ 
+ /**
+@@ -732,16 +837,15 @@ static int dpu_plane_atomic_check_pipe(struct dpu_plane *pdpu,
+ 	const struct msm_format *fmt;
+ 	uint32_t supported_rotations;
+ 	const struct dpu_sspp_cfg *pipe_hw_caps;
+-	const struct dpu_sspp_sub_blks *sblk;
+ 
+ 	pipe_hw_caps = pipe->sspp->cap;
+-	sblk = pipe->sspp->cap->sblk;
+ 
+ 	/*
+ 	 * We already have verified scaling against platform limitations.
+-	 * Now check if the SSPP supports scaling at all.
++	 * Now check if the SSPP supports scaling at all.  QSEED2 and QSEED3
++	 * pipes both do, through different operations.
+ 	 */
+-	if (!(sblk->scaler_blk.len && pipe->sspp->ops.setup_scaler) &&
++	if (!dpu_sspp_has_scaler(pipe->sspp) &&
+ 	    ((drm_rect_width(&new_plane_state->src) >> 16 !=
+ 	      drm_rect_width(&new_plane_state->dst)) ||
+ 	     (drm_rect_height(&new_plane_state->src) >> 16 !=
+@@ -750,6 +854,35 @@ static int dpu_plane_atomic_check_pipe(struct dpu_plane *pdpu,
+ 
+ 	fmt = msm_framebuffer_format(new_plane_state->fb);
+ 
++	/*
++	 * QSEED2 handles ratios beyond the filtered scaler limit through its
++	 * decimation block.  Work out the decimation and the resulting phase
++	 * steps here so that a geometry the block cannot implement is
++	 * rejected instead of being partially programmed.
++	 */
++	if (test_bit(DPU_SSPP_SCALER_QSEED2, &pipe_hw_caps->features)) {
++		const struct drm_format_info *info =
++			drm_format_info(fmt->pixel_format);
++		struct dpu_hw_scaler2_cfg scaler2_cfg;
++
++		ret = dpu_hw_scaler2_build_cfg(
++				drm_rect_width(&pipe_cfg->src_rect),
++				drm_rect_height(&pipe_cfg->src_rect),
++				drm_rect_width(&pipe_cfg->dst_rect),
++				drm_rect_height(&pipe_cfg->dst_rect),
++				info->hsub, info->vsub, MSM_FORMAT_IS_YUV(fmt),
++				kms->catalog->caps->max_hdeci_exp,
++				kms->catalog->caps->max_vdeci_exp,
++				&scaler2_cfg);
++		if (ret) {
++			DPU_DEBUG_PLANE(pdpu, "unsupported QSEED2 scaling "
++					DRM_RECT_FMT " -> " DRM_RECT_FMT " (%d)\n",
++					DRM_RECT_ARG(&pipe_cfg->src_rect),
++					DRM_RECT_ARG(&pipe_cfg->dst_rect), ret);
++			return ret;
++		}
++	}
++
+ 	supported_rotations = DRM_MODE_REFLECT_MASK | DRM_MODE_ROTATE_0;
+ 
+ 	if (pipe_hw_caps->features & BIT(DPU_SSPP_INLINE_ROTATION))
+@@ -812,6 +945,36 @@ static int dpu_plane_atomic_check_pipe(struct dpu_plane *pdpu,
+ #define MAX_UPSCALE_RATIO	20
+ #define MAX_DOWNSCALE_RATIO	4
+ 
++/*
++ * Platform-level maximum reduction for a plane.  QSEED2 VIG pipes can
++ * decimate before the filtered scaler, which extends the limit by the
++ * platform decimation capability.  dpu_plane_atomic_check_pipe() then
++ * enforces the exact per-axis bound for the SSPP that is actually used.
++ */
++static u32 _dpu_plane_max_downscale_ratio(struct dpu_plane *pdpu)
++{
++	const struct dpu_mdss_cfg *catalog = pdpu->catalog;
++	u32 max_deci = 0;
++	u32 i;
++
++	for (i = 0; i < catalog->sspp_count; i++) {
++		const struct dpu_sspp_cfg *cfg = &catalog->sspp[i];
++
++		if (cfg->id != pdpu->pipe)
++			continue;
++
++		if (cfg->features & BIT(DPU_SSPP_SCALER_QSEED2)) {
++			max_deci = catalog->caps->max_hdeci_exp;
++			if (catalog->caps->max_vdeci_exp > max_deci)
++				max_deci = catalog->caps->max_vdeci_exp;
++		}
++
++		break;
++	}
++
++	return MAX_DOWNSCALE_RATIO << max_deci;
++}
++
+ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
+ 					 struct drm_plane_state *new_plane_state,
+ 					 const struct drm_crtc_state *crtc_state)
+@@ -822,7 +985,7 @@ static int dpu_plane_atomic_check_nosspp(struct drm_plane *plane,
+ 	struct drm_rect fb_rect = { 0 };
+ 
+ 	min_scale = FRAC_16_16(1, MAX_UPSCALE_RATIO);
+-	max_scale = MAX_DOWNSCALE_RATIO << 16;
++	max_scale = _dpu_plane_max_downscale_ratio(pdpu) << 16;
+ 
+ 	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
+ 						  min_scale,
+@@ -1492,7 +1655,7 @@ static void dpu_plane_sspp_update_pipe(struct drm_plane *plane,
+ 				pipe_cfg);
+ 	}
+ 
+-	_dpu_plane_setup_scaler(pipe, fmt, false, pipe_cfg);
++	_dpu_plane_setup_scaler(pdpu, pipe, fmt, false, pipe_cfg);
+ 
+ 	if (pipe->sspp->ops.setup_multirect)
+ 		pipe->sspp->ops.setup_multirect(
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+index 7e77d88f895920cf2b755ba22cf2cc1f69b91452..8f6b55309a4d60ad902d6ff9f894d6f3ebb5910e 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_rm.c
+@@ -807,11 +807,7 @@ static struct dpu_hw_sspp *dpu_rm_try_sspp(struct dpu_rm *rm,
+ 		if (hw_sspp->cap->type != type)
+ 			continue;
+ 
+-		if (reqs->scale && !hw_sspp->cap->sblk->scaler_blk.len)
+-			continue;
+-
+-		// TODO: QSEED2 and RGB scalers are not yet supported
+-		if (reqs->scale && !hw_sspp->ops.setup_scaler)
++		if (reqs->scale && !dpu_sspp_has_scaler(hw_sspp))
+ 			continue;
+ 
+ 		if (reqs->yuv && !hw_sspp->cap->sblk->csc_blk.len)
